@@ -74,6 +74,46 @@ PyObject* py_schedule(PyObject* self, PyObject* args);
 PyObject* py_request_stop(PyObject* self, PyObject* args);
 
 /**
+ * @brief Stop only this federate, without requiring RTI involvement or consensus.
+ *
+ * Every enclave within the federate will stop at one microstep later than its
+ * current tag. Unlike py_request_stop, this does not require any involvement
+ * from the RTI. This is particularly useful for testing transient federates.
+ *
+ * @param self The calling Python object
+ * @param args Empty
+ * @return Py_None
+ */
+PyObject* py_lf_stop(PyObject* self, PyObject* args);
+
+/**
+ * @brief Return the global maxwait for the current federate.
+ *
+ * Only meaningful in decentralized federated execution. If the program is not
+ * compiled with FEDERATED_DECENTRALIZED, calling this from Python raises a
+ * RuntimeError.
+ *
+ * @param self The calling Python object
+ * @param args Empty
+ * @return PyLong (the maxwait in nanoseconds) on success, NULL on error.
+ */
+PyObject* py_get_fed_maxwait(PyObject* self, PyObject* args);
+
+/**
+ * @brief Set the global maxwait for the current federate.
+ *
+ * Only meaningful in decentralized federated execution. If the program is not
+ * compiled with FEDERATED_DECENTRALIZED, calling this from Python raises a
+ * RuntimeError.
+ *
+ * @param self The calling Python object
+ * @param args A tuple containing a single number (the maxwait offset in
+ *  nanoseconds, may be a non-negative integer or a double, e.g. MSEC(100)).
+ * @return Py_None on success, NULL on error.
+ */
+PyObject* py_set_fed_maxwait(PyObject* self, PyObject* args);
+
+/**
  * @brief Return the source directory path (where the main .lf file is) as a string.
  * @param self The lf object.
  * @param args Empty.
@@ -90,6 +130,18 @@ PyObject* py_source_directory(PyObject* self, PyObject* args);
 PyObject* py_package_directory(PyObject* self, PyObject* args);
 
 /**
+ * @brief Return the ID of the federation this federate belongs to.
+ *
+ * Only meaningful in federated execution. If the program is not compiled with
+ * FEDERATED, calling this from Python raises a RuntimeError.
+ *
+ * @param self The lf object.
+ * @param args Empty.
+ * @return PyObject* A Python string on success, NULL on error.
+ */
+PyObject* py_get_federation_id(PyObject* self, PyObject* args);
+
+/**
  * @brief Check whether the deadline of the currently executing reaction has passed.
  *
  * If the deadline has passed and invoke_deadline_handler is True,
@@ -101,6 +153,49 @@ PyObject* py_package_directory(PyObject* self, PyObject* args);
  * @return True if the deadline has passed and a deadline handler is invoked, False otherwise.
  */
 PyObject* py_check_deadline(PyObject* self, PyObject* args);
+
+/**
+ * @brief Update the deadline of the currently executing reaction.
+ *
+ * Updating the deadline with this function does not affect
+ * the deadline check that has been performed (at the beginning
+ * of the caller reaction or check_deadline called before).
+ * Therefore, you may want to invoke check_deadline after
+ * updating the deadline through this function to confirm
+ * whether the newly updated deadline has been violated.
+ *
+ * @param self The Python object of the reactor.
+ * @param args contains:
+ *      - updated_deadline: The updated deadline.
+ * @return Py_None or NULL if an error occurs.
+ */
+PyObject* py_update_deadline(PyObject* self, PyObject* args);
+
+/**
+ * @brief Register a user trace event. Returns an opaque handle for use with
+ * tracepoint_user_event and tracepoint_user_value.
+ *
+ * @param self The Python object of the reactor.
+ * @param args (py_self, description: str).
+ * @return PyLong (handle) or 0 if tracing is disabled or registration failed.
+ */
+PyObject* py_register_user_trace_event(PyObject* self, PyObject* args);
+
+/**
+ * @brief Trace a user-defined event at the current logical time.
+ *
+ * @param self The Python object of the reactor.
+ * @param args (py_self, handle) where handle is from register_user_trace_event.
+ */
+PyObject* py_tracepoint_user_event(PyObject* self, PyObject* args);
+
+/**
+ * @brief Trace a user-defined event with a value at the current logical time.
+ *
+ * @param self The Python object of the reactor.
+ * @param args (py_self, handle, value: int).
+ */
+PyObject* py_tracepoint_user_value(PyObject* self, PyObject* args);
 
 //////////////////////////////////////////////////////////////
 ///////////// Main function callable from Python code
@@ -168,20 +263,38 @@ PyObject* convert_C_action_to_py(void* action);
 PyObject* get_python_function(string module, string class, int instance_id, string func);
 
 /**
- * @brief Get a Python reactor instance by its module, class name, and instance ID.
+ * @brief Get a Python reactor instance by its module, Pythonclass name, and instance ID.
  *
  * @param module The Python module name (e.g. "__main__")
- * @param class The class name
+ * @param class The Python class name, which is `self->_lf_name`, uniquely identifying the reactor instance.
  * @param instance_id The instance ID
  * @return The Python reactor instance, or NULL if not found
  */
 PyObject* get_python_instance(string module, string class, int instance_id);
 
 /**
+ * @brief Get the value of a non-negative integer reactor instance parameter from the Python object.
+ *
+ * Look up the Python instance via get_python_instance(module, instance_name, instance_id),
+ * then retrieve the attribute param_name and convert it with PyLong_AsLong.
+ * This should only be used for parameters that are expected to be non-negative because -1
+ * is returned on error.
+ * The GIL is acquired and released internally.
+ *
+ * @param module The module name (e.g. "__main__").
+ * @param instance_name The instance name (which is `self->_lf_name`, uniquely identifying the reactor instance).
+ * @param instance_id The instance index in the Python list (typically 0 for non-banked).
+ * @param param_name The parameter attribute name (e.g. "sender_index").
+ * @return The parameter value as a long, or -1 on error (instance not found, attribute missing, or not an integer).
+ */
+long lf_py_get_nonnegative_integer_parameter(string module, string instance_name, int instance_id, string param_name);
+
+/**
  * @brief Set a python field to a hold a C pointer.
  *
  * @param module The module name.
- * @param class The class name of the Python object.
+ * @param class The class name of the Python object, which is `self->_lf_name`, uniquely identifying the reactor
+ * instance.
  * @param instance_id The instance ID of the Python object.
  * @param field The field name to set.
  * @param pointer The pointer for the field to hold.

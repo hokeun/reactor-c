@@ -56,11 +56,11 @@ static void send_failed_signal(federate_info_t* fed) {
   if (rti.base.tracing_enabled) {
     tracepoint_rti_to_federate(send_FAILED, fed->enclave.id, NULL);
   }
-  int failed = write_to_socket(fed->socket, bytes_to_write, &(buffer[0]));
+  int failed = write_to_net(fed->net, bytes_to_write, &(buffer[0]));
   if (failed == 0) {
     LF_PRINT_LOG("RTI has sent failed signal to federate %d due to abnormal termination.", fed->enclave.id);
   } else {
-    lf_print_error("RTI failed to send failed signal to federate %d on socket ID %d.", fed->enclave.id, fed->socket);
+    lf_print_error("RTI failed to send failed signal to federate %d.", fed->enclave.id);
   }
 }
 
@@ -77,17 +77,21 @@ static void send_failed_signal(federate_info_t* fed) {
  */
 void termination() {
   if (!normal_termination) {
-    for (int i = 0; i < rti.base.number_of_scheduling_nodes; i++) {
-      federate_info_t* f = (federate_info_t*)rti.base.scheduling_nodes[i];
-      if (!f || f->enclave.state == NOT_CONNECTED)
-        continue;
-      send_failed_signal(f);
+    // scheduling_nodes may still be NULL if we exit before federate allocation
+    // (e.g. after a command-line argument error).
+    if (rti.base.scheduling_nodes != NULL) {
+      for (int i = 0; i < rti.base.number_of_scheduling_nodes; i++) {
+        federate_info_t* f = (federate_info_t*)rti.base.scheduling_nodes[i];
+        if (!f || f->enclave.state == NOT_CONNECTED)
+          continue;
+        send_failed_signal(f);
+      }
     }
     if (rti.base.tracing_enabled) {
       lf_tracing_global_shutdown();
-      lf_print("RTI trace file saved.");
+      lf_print_info("RTI trace file saved.");
     }
-    lf_print("RTI is exiting abnormally.");
+    lf_print_warning("RTI is exiting abnormally.");
   }
 }
 
@@ -99,6 +103,8 @@ void usage(int argc, const char* argv[]) {
   lf_print("   The ID of the federation that this RTI will control.\n");
   lf_print("  -n, --number_of_federates <n>");
   lf_print("   The number of federates in the federation that this RTI will control.\n");
+  lf_print("  -nt, --number_of_transient_federates <n>");
+  lf_print("   The number of transient federates in the federation that this RTI will control.\n");
   lf_print("  -p, --port <n>");
   lf_print("   The port number to use for the RTI. Must be larger than 0 and smaller than %d. Default is %d.\n",
            UINT16_MAX, DEFAULT_PORT);
@@ -112,9 +118,14 @@ void usage(int argc, const char* argv[]) {
   lf_print("          (period in nanoseconds, default is 5 msec). Only applies to 'on'.");
   lf_print("       - exchanges-per-interval <n>: Controls the number of messages that are exchanged for each");
   lf_print("          clock sync attempt (default is 10). Applies to 'init' and 'on'.\n");
+  lf_print("  -m, --start-time-multiple <value> <units>");
+  lf_print("   Delay the federation start so that the starting logical time is a multiple of the");
+  lf_print("   specified time, where units are one of ns, us, ms, s, min, hour, day, or week.\n");
   lf_print("  -a, --auth Turn on HMAC authentication options.\n");
   lf_print("  -t, --tracing Turn on tracing.\n");
   lf_print("  -d, --disable_dnet Turn off the use of DNET signals.\n");
+  lf_print("  -sst, --sst SST config path for RTI.\n");
+  lf_print("  -tls, --tls <cert_path> <key_path>   TLS certificate and private key paths.\n");
 
   lf_print("Command given:");
   for (int i = 0; i < argc; i++) {
@@ -133,13 +144,13 @@ int process_clock_sync_args(int argc, const char* argv[]) {
   for (int i = 0; i < argc; i++) {
     if (strcmp(argv[i], "off") == 0) {
       rti.clock_sync_global_status = clock_sync_off;
-      lf_print("RTI: Clock sync: off");
+      lf_print_info("RTI: Clock sync: off");
     } else if (strcmp(argv[i], "init") == 0 || strcmp(argv[i], "initial") == 0) {
       rti.clock_sync_global_status = clock_sync_init;
-      lf_print("RTI: Clock sync: init");
+      lf_print_info("RTI: Clock sync: init");
     } else if (strcmp(argv[i], "on") == 0) {
       rti.clock_sync_global_status = clock_sync_on;
-      lf_print("RTI: Clock sync: on");
+      lf_print_info("RTI: Clock sync: on");
     } else if (strcmp(argv[i], "period") == 0) {
       if (rti.clock_sync_global_status != clock_sync_on) {
         lf_print_error("clock sync period can only be set if --clock-sync is set to on.");
@@ -158,7 +169,7 @@ int process_clock_sync_args(int argc, const char* argv[]) {
         continue; // Try to parse the rest of the arguments as clock sync args.
       }
       rti.clock_sync_period_ns = (int64_t)period_ns;
-      lf_print("RTI: Clock sync period: %lld", (long long int)rti.clock_sync_period_ns);
+      lf_print_info("RTI: Clock sync period: %lld", (long long int)rti.clock_sync_period_ns);
     } else if (strcmp(argv[i], "exchanges-per-interval") == 0) {
       if (rti.clock_sync_global_status != clock_sync_on && rti.clock_sync_global_status != clock_sync_init) {
         lf_print_error("clock sync exchanges-per-interval can only be set if\n"
@@ -172,12 +183,12 @@ int process_clock_sync_args(int argc, const char* argv[]) {
       }
       i++;
       long exchanges = (long)strtol(argv[i], NULL, 10);
-      if (exchanges == 0L || exchanges == LONG_MAX || exchanges == LONG_MIN) {
+      if (exchanges <= 0L || exchanges > INT32_MAX || exchanges == LONG_MAX || exchanges == LONG_MIN) {
         lf_print_error("clock sync exchanges-per-interval value is invalid.");
         continue; // Try to parse the rest of the arguments as clock sync args.
       }
-      rti.clock_sync_exchanges_per_interval = (int32_t)exchanges; // FIXME: Loses numbers on 64-bit machines
-      lf_print("RTI: Clock sync exchanges per interval: %d", rti.clock_sync_exchanges_per_interval);
+      rti.clock_sync_exchanges_per_interval = (int32_t)exchanges;
+      lf_print_info("RTI: Clock sync exchanges per interval: %d", rti.clock_sync_exchanges_per_interval);
     } else if (strcmp(argv[i], " ") == 0) {
       // Tolerate spaces
       continue;
@@ -202,7 +213,7 @@ int process_args(int argc, const char* argv[]) {
         return 0;
       }
       i++;
-      lf_print("RTI: Federation ID: %s", argv[i]);
+      lf_print_log("RTI: Federation ID: %s", argv[i]);
       rti.federation_id = argv[i];
     } else if (strcmp(argv[i], "-n") == 0 || strcmp(argv[i], "--number_of_federates") == 0) {
       if (argc < i + 2) {
@@ -212,14 +223,36 @@ int process_args(int argc, const char* argv[]) {
       }
       i++;
       long num_federates = strtol(argv[i], NULL, 10);
-      if (num_federates <= 0L || num_federates == LONG_MAX || num_federates == LONG_MIN) {
-        lf_print_error("--number_of_federates needs a valid positive integer argument.");
+      if (num_federates <= 0L || num_federates >= UINT16_MAX || num_federates == LONG_MAX ||
+          num_federates == LONG_MIN) {
+        lf_print_error("--number_of_federates needs a positive integer argument ( > 0 and < %d).", UINT16_MAX);
         usage(argc, argv);
         return 0;
       }
-      rti.base.number_of_scheduling_nodes = (int32_t)num_federates; // FIXME: Loses numbers on 64-bit machines
-      lf_print("RTI: Number of federates: %d", rti.base.number_of_scheduling_nodes);
+      rti.base.number_of_scheduling_nodes = (uint16_t)num_federates;
+      lf_print_info("RTI: Number of federates: %d", rti.base.number_of_scheduling_nodes);
+    } else if (strcmp(argv[i], "-nt") == 0 || strcmp(argv[i], "--number_of_transient_federates") == 0) {
+      if (argc < i + 2) {
+        lf_print_error("--number_of_transient_federates needs a non-negative integer argument ( >= 0 and < %d).",
+                       INT32_MAX);
+        usage(argc, argv);
+        return 0;
+      }
+      i++;
+      long num_transient_federates = strtol(argv[i], NULL, 10);
+      // Zero is valid: the launcher always passes -nt, including for federations
+      // with no transient federates.
+      if (num_transient_federates < 0L || num_transient_federates > INT32_MAX || num_transient_federates == LONG_MAX ||
+          num_transient_federates == LONG_MIN) {
+        lf_print_error("--number_of_transient_federates needs a non-negative integer argument ( >= 0 and < %d).",
+                       INT32_MAX);
+        usage(argc, argv);
+        return 0;
+      }
+      rti.number_of_transient_federates = (int32_t)num_transient_federates;
+      lf_print_info("RTI: Number of transient federates: %d", rti.number_of_transient_federates);
     } else if (strcmp(argv[i], "-p") == 0 || strcmp(argv[i], "--port") == 0) {
+#if defined(COMM_TYPE_TCP) || defined(COMM_TYPE_SST) || defined(COMM_TYPE_TLS)
       if (argc < i + 2) {
         lf_print_error("--port needs a short unsigned integer argument ( > 0 and < %d).", UINT16_MAX);
         usage(argc, argv);
@@ -233,6 +266,9 @@ int process_args(int argc, const char* argv[]) {
         return 0;
       }
       rti.user_specified_port = (uint16_t)RTI_port;
+#else
+      lf_print_error("--port is only available for TCP.");
+#endif
     } else if (strcmp(argv[i], "-c") == 0 || strcmp(argv[i], "--clock_sync") == 0) {
       if (argc < i + 2) {
         lf_print_error("--clock-sync needs off|init|on.");
@@ -248,6 +284,68 @@ int process_args(int argc, const char* argv[]) {
       return 0;
 #endif
       rti.authentication_enabled = true;
+    } else if (strcmp(argv[i], "-sst") == 0 || strcmp(argv[i], "--sst") == 0) {
+#ifndef COMM_TYPE_SST
+      lf_print_error("--sst requires the RTI to be built with the --DCOMM_TYPE=SST option.");
+      usage(argc, argv);
+      return 0;
+#else
+      if (argc < i + 2) {
+        lf_print_error("--sst needs one argument: <sst_config_path>.");
+        usage(argc, argv);
+        return 0;
+      }
+      i++;
+      lf_set_sst_config_path(argv[i]);
+#endif
+    } else if (strcmp(argv[i], "-tls") == 0 || strcmp(argv[i], "--tls") == 0) {
+#ifndef COMM_TYPE_TLS
+      lf_print_error("--tls requires the RTI to be built with the -DCOMM_TYPE=TLS option.");
+      usage(argc, argv);
+      return 0;
+#else
+      // Need two arguments: cert path and key path
+      if (argc < i + 3) {
+        lf_print_error("--tls needs two arguments: <certificate_path> <private_key_path>.");
+        usage(argc, argv);
+        return 0;
+      }
+      const char* cert_path = argv[i + 1];
+      const char* key_path = argv[i + 2];
+
+      // Optional: basic sanity check (avoid empty strings)
+      if (cert_path[0] == '\0' || key_path[0] == '\0') {
+        lf_print_error("--tls certificate_path and private_key_path must be non-empty.");
+        usage(argc, argv);
+        return 0;
+      }
+
+      lf_set_tls_configuration(cert_path, key_path);
+      lf_print_debug("RTI: TLS cert path: %s", cert_path);
+      lf_print_debug("RTI: TLS key path : %s", key_path);
+      i += 2;
+#endif
+    } else if (strcmp(argv[i], "-m") == 0 || strcmp(argv[i], "--start-time-multiple") == 0) {
+      if (argc < i + 3) {
+        lf_print_error("--start-time-multiple needs a time value and units.");
+        usage(argc, argv);
+        return 0;
+      }
+      const char* time_spec = argv[i + 1];
+      const char* units = argv[i + 2];
+      int parse_result = lf_time_parse(time_spec, units, &rti.start_time_multiple);
+      if (parse_result != 0) {
+        lf_print_error("--start-time-multiple has an invalid time value or units: %s %s", time_spec, units);
+        usage(argc, argv);
+        return 0;
+      }
+      if (rti.start_time_multiple < 0LL) {
+        lf_print_error("--start-time-multiple needs a non-negative time value.");
+        usage(argc, argv);
+        return 0;
+      }
+      i += 2;
+      lf_print_info("RTI: Start time multiple: " PRINTF_TIME " ns", rti.start_time_multiple);
     } else if (strcmp(argv[i], "-t") == 0 || strcmp(argv[i], "--tracing") == 0) {
       rti.base.tracing_enabled = true;
     } else if (strcmp(argv[i], "-d") == 0 || strcmp(argv[i], "--dnet_disabled") == 0) {
@@ -261,6 +359,17 @@ int process_args(int argc, const char* argv[]) {
       return 0;
     }
   }
+  if (rti.base.number_of_scheduling_nodes == 0) {
+    lf_print_error("--number_of_federates needs a positive integer argument ( > 0 and < %d).", UINT16_MAX);
+    usage(argc, argv);
+    return 0;
+  }
+  if (rti.number_of_transient_federates >= rti.base.number_of_scheduling_nodes) {
+    lf_print_error("--number_of_transient_federates must be less than the number of federates.");
+    usage(argc, argv);
+    return 0;
+  }
+  rti.base.has_transients = (rti.number_of_transient_federates > 0);
   return 1;
 }
 int main(int argc, const char* argv[]) {
@@ -285,6 +394,8 @@ int main(int argc, const char* argv[]) {
 
   if (!process_args(argc, argv)) {
     // Processing command-line arguments failed.
+    // Avoid the atexit handler treating this as an abnormal runtime failure.
+    normal_termination = true;
     return -1;
   }
 
@@ -297,11 +408,11 @@ int main(int argc, const char* argv[]) {
     // connections attempted after initialization phase has completed. Add 1
     // for the main thread.
     lf_tracing_global_init("rti", NULL, -1, _lf_number_of_workers * 2 + 3);
-    lf_print("Tracing the RTI execution in %s file.", rti_trace_file_name);
+    lf_print_info("Tracing the RTI execution in %s file.", rti_trace_file_name);
   }
 
-  lf_print("Starting RTI for %d federates in federation ID %s.", rti.base.number_of_scheduling_nodes,
-           rti.federation_id);
+  lf_print_log("Starting RTI for a total of %d federates, with %d being transient, in federation ID %s",
+               rti.base.number_of_scheduling_nodes, rti.number_of_transient_federates, rti.federation_id);
   assert(rti.base.number_of_scheduling_nodes < UINT16_MAX);
 
   // Allocate memory for the federates
@@ -313,18 +424,17 @@ int main(int argc, const char* argv[]) {
     rti.base.scheduling_nodes[i] = (scheduling_node_t*)fed_info;
   }
 
-  int socket_descriptor = start_rti_server(rti.user_specified_port);
-  if (socket_descriptor >= 0) {
-    wait_for_federates(socket_descriptor);
+  if (!start_rti_server()) {
+    wait_for_federates();
     normal_termination = true;
     if (rti.base.tracing_enabled) {
       // No need for a mutex lock because all threads have exited.
       lf_tracing_global_shutdown();
-      lf_print("RTI trace file saved.");
+      lf_print_info("RTI trace file saved.");
     }
   }
 
-  lf_print("RTI is exiting."); // Do this before freeing scheduling nodes.
+  lf_print_info("RTI is exiting."); // Do this before freeing scheduling nodes.
   free_scheduling_nodes(rti.base.scheduling_nodes, rti.base.number_of_scheduling_nodes);
 
   // Even if the RTI is exiting normally, it should report an error code if one of the

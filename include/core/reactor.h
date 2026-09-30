@@ -58,34 +58,76 @@ void lf_set_present(lf_port_base_t* port);
  */
 void lf_set_stop_tag(environment_t* env, tag_t tag);
 
+#ifdef FEDERATED
+
+/**
+ * @brief Set the federation ID of this federate.
+ * @ingroup Federated
+ *
+ * @param fid The federation ID.
+ */
+void lf_set_federation_id(const char* fid);
+
+/**
+ * @brief Return the federation ID.
+ * @ingroup Federated
+ */
+const char* lf_get_federation_id();
+
+/**
+ * @brief Return true if the RTI has reported failure.
+ * @ingroup Federated
+ *
+ * Set by the RTI listener thread when it receives MSG_TYPE_FAILED.
+ * The main thread uses this to return a nonzero status without calling
+ * exit() from the listener.
+ */
+bool lf_rti_has_failed(void);
+
+#endif // FEDERATED
+
 #ifdef FEDERATED_DECENTRALIZED
 
 /**
  * @brief Return the global STP offset on advancement of logical time for federated execution.
- * @deprecated Use lf_get_sta() instead.
+ * @deprecated Use lf_get_fed_maxwait() instead.
  */
 interval_t lf_get_stp_offset(void);
 
 /**
  * @brief Return the global STA (safe to advance) offset for federated execution.
  * @ingroup Federated
+ * @deprecated Use lf_get_fed_maxwait() instead.
  */
 interval_t lf_get_sta(void);
 
 /**
+ * @brief Return the global maxwait for the current federate.
+ * @ingroup Federated
+ */
+interval_t lf_get_fed_maxwait(void);
+
+/**
  * @brief Set the global STP offset on advancement of logical time for federated execution.
  * @param offset A non-negative time value to be applied as the STP offset.
- * @deprecated Use lf_set_sta() instead.
+ * @deprecated Use lf_set_fed_maxwait() instead.
  */
 void lf_set_stp_offset(interval_t offset);
 
 /**
  * @brief Set the global STA (safe to advance) offset for federated execution.
  * @ingroup Federated
- *
  * @param offset A non-negative time value to be applied as the STA offset.
+ * @deprecated Use lf_set_fed_maxwait() instead.
  */
 void lf_set_sta(interval_t offset);
+
+/**
+ * @brief Set the global maxwait for the current federate.
+ * @ingroup Federated
+ * @param offset A non-negative time value to be applied as the maxwait.
+ */
+void lf_set_fed_maxwait(interval_t offset);
 
 #endif // FEDERATED_DECENTRALIZED
 

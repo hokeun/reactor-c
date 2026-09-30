@@ -18,7 +18,6 @@ list(APPEND REACTORC_SOURCES ${GENERAL_SOURCES})
 # Add sources for either threaded or single-threaded runtime
 if(DEFINED FEDERATED)
     include(federated/CMakeLists.txt)
-    include(federated/network/CMakeLists.txt)
 endif()
 
 # Add sources for either threaded or single-threaded runtime
@@ -53,29 +52,7 @@ add_library(reactor-c)
 target_sources(reactor-c PRIVATE ${REACTORC_SOURCES})
 lf_enable_compiler_warnings(reactor-c)
 
-if(DEFINED LF_TRACE)
-    include(${LF_ROOT}/trace/api/CMakeLists.txt)
-    target_link_libraries(reactor-c PUBLIC lf::trace-api)
-    # If the user specified an external trace plugin. Find it and link with it
-    if (LF_TRACE_PLUGIN)
-        message(STATUS "Linking trace plugin library ${LF_TRACE_PLUGIN}")
-        find_library(TRACE_LIB NAMES ${LF_TRACE_PLUGIN} HINTS "${LF_ROOT}")
-        if (NOT TRACE_LIB)
-            message(FATAL_ERROR "The trace plugin library ${LF_TRACE_PLUGIN} not found")
-        endif()
-        # We also link with libdl because it is needed for some platforms.
-        # TODO: Figure out why this is the case and how to avoid it.
-        target_link_libraries(reactor-c PRIVATE ${TRACE_LIB} dl)
-    else()
-    # If not, use the default implementation
-        message(STATUS "Linking with default trace implementation")
-        include(${LF_ROOT}/trace/impl/CMakeLists.txt)
-        target_link_libraries(reactor-c PRIVATE lf::trace-impl)
-    endif()
-else()
-    include(${LF_ROOT}/trace/api/types/CMakeLists.txt)
-    target_link_libraries(reactor-c PUBLIC lf::trace-api-types)
-endif()
+include(${LF_ROOT}/core/lf_trace.cmake)
 
 include(${LF_ROOT}/version/api/CMakeLists.txt)
 target_link_libraries(reactor-c PUBLIC lf::version-api)
@@ -96,10 +73,19 @@ include(${LF_ROOT}/platform/impl/CMakeLists.txt)
 target_link_libraries(reactor-c PUBLIC lf::platform-api)
 target_link_libraries(reactor-c PRIVATE lf::platform-impl)
 
+if(DEFINED FEDERATED)
+    if(NOT DEFINED COMM_TYPE)
+        set(COMM_TYPE TCP)
+    endif()
+    include(${LF_ROOT}/network/api/CMakeLists.txt)
+    include(${LF_ROOT}/network/impl/CMakeLists.txt)
+    target_link_libraries(reactor-c PUBLIC lf::network-api)
+    target_link_libraries(reactor-c PUBLIC lf::network-impl)
+endif()
+
 target_include_directories(reactor-c PUBLIC ../include)
 target_include_directories(reactor-c PUBLIC ../include/core)
 target_include_directories(reactor-c PUBLIC ../include/core/federated)
-target_include_directories(reactor-c PUBLIC ../include/core/federated/network)
 target_include_directories(reactor-c PUBLIC ../include/core/platform)
 target_include_directories(reactor-c PUBLIC ../include/core/modal_models)
 target_include_directories(reactor-c PUBLIC ../include/core/threaded)
@@ -116,7 +102,13 @@ endif()
 # Link with OpenSSL library
 if(DEFINED FEDERATED_AUTHENTICATED)
     if(APPLE)
-        set(OPENSSL_ROOT_DIR /usr/local/opt/openssl)
+        # Apple Silicon Mac
+        if(EXISTS "/opt/homebrew/opt/openssl")
+            set(OPENSSL_ROOT_DIR "/opt/homebrew/opt/openssl")
+        # Intel Mac
+        elseif(EXISTS "/usr/local/opt/openssl")
+            set(OPENSSL_ROOT_DIR "/usr/local/opt/openssl")
+        endif()
     endif()
 
     find_package(OpenSSL REQUIRED)

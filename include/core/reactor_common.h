@@ -29,6 +29,41 @@
 #include "modes.h"
 #include "port.h"
 
+//////////////////////  CLI Parameter Table  //////////////////////
+
+/**
+ * @brief Type tag for a user-defined CLI parameter.
+ * @ingroup Internal
+ */
+typedef enum {
+  CLI_TIME,   ///< interval_t, parsed as value + units (e.g., "500 msec").
+  CLI_INT,    ///< int, parsed with atoi.
+  CLI_DOUBLE, ///< double, parsed with strtod.
+  CLI_FLOAT,  ///< float, parsed with strtof.
+  CLI_BOOL,   ///< bool, parsed as "true"/"false" or "1"/"0".
+  CLI_STRING  ///< const char*, set directly from the argument string.
+} lf_cli_type_t;
+
+/**
+ * @brief Descriptor for a user-defined main reactor parameter overridable from the command line.
+ * @ingroup Internal
+ *
+ * The code generator populates an array of these structs so that the runtime
+ * can parse user parameters in a table-driven fashion, without generating
+ * large if-else chains.
+ */
+typedef struct {
+  const char* name;        ///< Parameter name (e.g., "period").
+  lf_cli_type_t type;      ///< The type of the parameter value.
+  void* value;             ///< Pointer to the storage variable.
+  bool* given;             ///< Pointer to a bool that is set to true when the arg is provided.
+  const char* description; ///< Description for the help message (e.g., "time value (default: 1 sec)").
+  bool is_width;           ///< True if this parameter is used for multiport/bank widths (not overridable).
+} lf_cli_param_t;
+
+extern lf_cli_param_t* _lf_cli_params;
+extern int _lf_cli_params_count;
+
 //////////////////////  Constants & Macros  //////////////////////
 
 /**
@@ -56,6 +91,23 @@ extern const char** default_argv;
 extern instant_t duration;
 extern bool fast;
 extern bool keepalive_specified;
+extern instant_t start_time_multiple;
+
+/**
+ * @brief Round the given time up to the next integer multiple of `start_time_multiple`.
+ * @ingroup Internal
+ *
+ * If `start_time_multiple` is 0 (the default), the time is returned unchanged.
+ * Otherwise, the smallest multiple of `start_time_multiple` that is greater than
+ * or equal to `time` is returned. This is used to implement the
+ * `-m`/`--start-time-multiple` command-line option, which delays the start of
+ * the program so that the starting logical time is a multiple of the specified
+ * value.
+ *
+ * @param time The time to align.
+ * @return The aligned time.
+ */
+instant_t lf_align_to_start_time_multiple(instant_t time);
 
 #ifdef FEDERATED_DECENTRALIZED
 extern interval_t lf_fed_STA_offset;
@@ -247,8 +299,8 @@ event_t* _lf_create_dummy_events(environment_t* env, tag_t tag);
  * relative to the current tag (or the environment has not started executing). Also, it must be called
  * with tags that are in order for a given trigger. This means that the following order is illegal:
  * ```
- * _lf_schedule_at_tag(trigger1, bigger_tag, ...);
- * _lf_schedule_at_tag(trigger1, smaller_tag, ...);
+ * _lf_schedule_at_tag(env, trigger1, bigger_tag, ...);
+ * _lf_schedule_at_tag(env, trigger1, smaller_tag, ...);
  * ```
  * where `bigger_tag > smaller_tag`. This function is primarily
  * used for network communication (which is assumed to be in order).
@@ -265,6 +317,39 @@ event_t* _lf_create_dummy_events(environment_t* env, tag_t tag);
  *  than the current tag).
  */
 trigger_handle_t _lf_schedule_at_tag(environment_t* env, trigger_t* trigger, tag_t tag, lf_token_t* token);
+
+/**
+ * @brief Schedule the specified action at a later tag with the specified token as a payload.
+ * @ingroup Internal
+ *
+ * This is an internal API that is identical to `lf_schedule_token` except that it takes
+ * an environment as an argument.
+ *
+ * @param env Environment in which we are executing.
+ * @param action The action to be triggered (a pointer to an `lf_action_base_t`).
+ * @param extra_delay Extra offset of the event release above that in the action.
+ * @param token The token to carry the payload or null for no payload.
+ * @return A handle to the event, or 0 if no event was scheduled, or -1 for error.
+ */
+trigger_handle_t _lf_schedule_token(environment_t* env, void* action, interval_t extra_delay, lf_token_t* token);
+
+/**
+ * @brief Schedule an action to occur with the specified value and time offset with a
+ * copy of the specified value.
+ * @ingroup Internal
+ *
+ * This is an internal API that is identical to `lf_schedule_copy` except that it takes
+ * an environment as an argument.
+ *
+ * @param env Environment in which we are executing.
+ * @param action The action to be triggered (a pointer to an `lf_action_base_t`).
+ * @param offset The time offset over and above that in the action.
+ * @param value A pointer to the value to copy.
+ * @param length The length, if an array, 1 if a scalar, and 0 if value is NULL.
+ * @return A handle to the event, or 0 if no event was scheduled, or -1 for
+ *  error.
+ */
+trigger_handle_t _lf_schedule_copy(environment_t* env, void* action, interval_t offset, void* value, size_t length);
 
 /**
  * @brief Insert reactions triggered by trigger to the reaction queue.
@@ -329,6 +414,31 @@ void schedule_output_reactions(environment_t* env, reaction_t* reaction, int wor
  * @param argv The command-line arguments.
  */
 int process_args(int argc, const char* argv[]);
+
+/**
+ * @brief Process user-defined main reactor parameters from the command line.
+ * @ingroup Internal
+ *
+ * Parses user-defined parameters from argv using the table in _lf_cli_params.
+ * Recognized parameters are consumed; the remaining arguments are copied into
+ * newargv/newargc so they can be forwarded to lf_reactor_c_main().
+ *
+ * @param argc The number of command-line arguments.
+ * @param argv The command-line arguments.
+ * @param newargc Output: number of remaining (unrecognized) arguments.
+ * @param newargv Output: array of remaining arguments (must be pre-allocated to at least argc).
+ * @return 0 on success, non-zero on error (the program should exit).
+ */
+int process_user_args(int argc, const char* argv[], int* newargc, const char** newargv);
+
+/**
+ * @brief Print a usage message listing both user-defined parameters and runtime options.
+ * @ingroup Internal
+ *
+ * @param argc The number of command-line arguments.
+ * @param argv The command-line arguments.
+ */
+void usage(int argc, const char* argv[]);
 
 /**
  * @brief Initialize global variables and start tracing before calling the

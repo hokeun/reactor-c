@@ -15,13 +15,6 @@
 #ifndef RTI_REMOTE_H
 #define RTI_REMOTE_H
 
-#include <sys/socket.h>
-#include <sys/types.h>  // Provides select() function to read from multiple sockets.
-#include <netinet/in.h> // Defines struct sockaddr_in
-#include <arpa/inet.h>  // inet_ntop & inet_pton
-#include <unistd.h>     // Defines read(), write(), and close()
-#include <strings.h>    // Defines bzero().
-
 #include "rti_common.h"
 
 #ifdef __RTI_AUTH__
@@ -31,7 +24,7 @@
 
 #include "lf_types.h"
 #include "pqueue_tag.h"
-#include "socket_common.h"
+#include "net_abstraction.h"
 
 /**
  * @brief Time allowed for federates to reply to stop request.
@@ -60,8 +53,8 @@ typedef struct federate_info_t {
   bool requested_stop;
   /** @brief The ID of the thread handling communication with this federate. */
   lf_thread_t thread_id;
-  /** @brief The TCP socket descriptor for communicating with this federate. */
-  int socket;
+  /** @brief The network abstraction for communicating with this federate. */
+  net_abstraction_t net;
   /** @brief The UDP address for the federate. */
   struct sockaddr_in UDP_addr;
   /** @brief Indicates the status of clock synchronization for this federate. Enabled by default. */
@@ -69,13 +62,29 @@ typedef struct federate_info_t {
   /** @brief Record of in-transit messages to this federate that are not yet processed. This record is ordered based on
    * the time value of each message for a more efficient access. */
   pqueue_tag_t* in_transit_message_tags;
-  /** @brief Human-readable IP address of the federate's socket server. */
-  char server_hostname[INET_ADDRSTRLEN];
-  /** @brief Port number of the socket server of the federate. The port number will be -1 if there is no server or if
-   * the RTI has not been informed of the port number. */
-  int32_t server_port;
-  /** @brief Information about the IP address of the socket server of the federate. */
-  struct in_addr server_ip_addr;
+  /** @brief Indicates whether the federate has upstream transient federates. */
+  bool has_upstream_transient_federates;
+  /** @brief Indicates whether the federate is transient or persistent. */
+  bool is_transient;
+  /** @brief Records the start time of the federate, which is mainly useful for transient federates. */
+  tag_t effective_start_tag;
+  /** @brief The highest delay-adjusted intended tag of any message the RTI has received addressed
+   *  to this federate, whether or not that message was actually forwarded (a message is not
+   *  forwarded, e.g., if the destination is a transient that is absent or has not yet started).
+   *  Unlike in_transit_message_tags, this is deliberately NOT cleared when a transient federate
+   *  disconnects: it is used when the federate later rejoins to compute an effective_start_tag
+   *  that accounts for messages that arrived while it was absent, even though those messages
+   *  themselves were dropped rather than queued. */
+  tag_t max_intended_tag;
+  /** @brief True after the first MSG_TYPE_NEIGHBOR_STRUCTURE has been accepted for this federate ID.
+   *  Preserved across transient resign/reset so rejoins and hot swaps can validate against that reference. */
+  bool neighbor_structure_received;
+  /** @brief Number of outbound connections to transient federates. */
+  int32_t number_of_downstream_transients;
+  /** @brief IDs of transient federates this federate has outbound connections to.
+   *  The array has size equal to the total number of transient federates in the federation,
+   *  and entries are initialized (and reset) to -1. */
+  int32_t* downstream_transients;
 } federate_info_t;
 
 /**
@@ -83,6 +92,29 @@ typedef struct federate_info_t {
  * @ingroup RTI
  */
 typedef enum clock_sync_stat { clock_sync_off, clock_sync_init, clock_sync_on } clock_sync_stat;
+
+/**
+ * The federation life cycle phases.
+ */
+typedef enum federation_life_cycle_phase {
+  startup_phase,   // Not all persistent federates have joined.
+  execution_phase, // All persistent federates have joined.
+  shutdown_phase   // Federation is shutting down.
+} federation_life_cycle_phase;
+
+/**
+ * @brief The type for an element in a delayed grants priority queue that is sorted by tag.
+ */
+typedef struct pqueue_delayed_grant_element_t {
+  pqueue_tag_element_t base;
+  uint16_t fed_id;     // Id of the federate with delayed grant of tag (in base)
+  bool is_provisional; // Boolean recoding if the delayed grant is provisional
+} pqueue_delayed_grant_element_t;
+
+/**
+ * @brief Type of a delayed grants queue sorted by tags.
+ */
+typedef pqueue_tag_t pqueue_delayed_grants_t;
 
 /**
  * @brief Structure that an RTI instance uses to keep track of its own and its
@@ -104,6 +136,16 @@ typedef struct rti_remote_t {
   /** @brief Maximum start time seen so far from the federates. */
   int64_t max_start_time;
 
+  /**
+   * @brief If nonzero, the federation start time is delayed so that the
+   * starting logical time is an integer multiple of this value (in nanoseconds).
+   *
+   * The default of 0 means that no such alignment is performed. This is set by
+   * the `-m` or `--start-time-multiple` command-line option, which the generated
+   * launch script forwards to the RTI.
+   */
+  int64_t start_time_multiple;
+
   /** @brief Number of federates that have proposed start times. */
   int num_feds_proposed_start;
 
@@ -119,6 +161,16 @@ typedef struct rti_remote_t {
   volatile bool all_federates_exited;
 
   /**
+   * @brief Boolean indicating that all persistent federates have exited.
+   *
+   * This gets set to true exactly once before the program waits for
+   * persistent federates, then exits.
+   * It is marked volatile because the write is not guarded by a mutex.
+   * The main thread makes this true.
+   */
+  volatile bool all_persistent_federates_exited;
+
+  /**
    * @brief The ID of the federation that this RTI will supervise.
    *
    * This should be overridden with a command-line -i option to ensure
@@ -126,20 +178,21 @@ typedef struct rti_remote_t {
    */
   const char* federation_id;
 
-  /** @brief The desired port specified by the user on the command line. */
+  /** @brief The desired port specified by the user on the command line.
+   * This should be not moved to the net_abstraction_t, because the user can configure this as -p or --port.
+   */
   uint16_t user_specified_port;
-
-  /** @brief The final port number that the TCP socket server ends up using. */
-  uint16_t final_port_TCP;
-
-  /** @brief The TCP socket descriptor for the socket server. */
-  int socket_descriptor_TCP;
 
   /** @brief The final port number that the UDP socket server ends up using. */
   uint16_t final_port_UDP;
 
   /** @brief The UDP socket descriptor for the socket server. */
   int socket_descriptor_UDP;
+
+  /**
+   * The rti's network abstraction.
+   */
+  net_abstraction_t rti_net;
 
   /** @brief Thread performing PTP clock sync sessions periodically. */
   lf_thread_t clock_thread;
@@ -162,6 +215,27 @@ typedef struct rti_remote_t {
 
   /** @brief Boolean indicating that a stop request is already in progress. */
   bool stop_in_progress;
+
+  /**
+   * Number of transient federates
+   */
+  int32_t number_of_transient_federates;
+
+  /**
+   * Number of connected transient federates
+   */
+  int32_t number_of_connected_transient_federates;
+
+  /**
+   * Indicates the life cycle phase of the federation.
+   */
+  federation_life_cycle_phase phase;
+
+  /**
+   * Queue of the pending grants, in case transient federates are absent and
+   * issuing grants to their downstreams need to be delayed.
+   */
+  pqueue_delayed_grants_t* delayed_grants;
 } rti_remote_t;
 
 extern int lf_critical_section_enter(environment_t* env);
@@ -284,8 +358,8 @@ void handle_address_query(uint16_t fed_id);
  * byte. The RTI will keep a record of this number in the .server_port
  * field of the _RTI.federates[federate_id] array of structs.
  *
- * The server_hostname and server_ip_addr fields are assigned
- * in lf_connect_to_federates() upon accepting the socket
+ * The server_ip_addr field is assigned
+ * in lf_connect_to_persistent_federates() upon accepting the socket
  * from the remote federate.
  *
  * This function assumes the caller does not hold the mutex.
@@ -293,14 +367,6 @@ void handle_address_query(uint16_t fed_id);
  * @param federate_id The id of the remote federate that is sending the address advertisement.
  */
 void handle_address_ad(uint16_t federate_id);
-
-/**
- * @brief A function to handle timestamp messages.
- * @ingroup RTI
- *
- * This function assumes the caller does not hold the mutex.
- */
-void handle_timestamp(federate_info_t* my_fed);
 
 /**
  * @brief Take a snapshot of the physical clock time and send it to federate fed_id.
@@ -359,24 +425,13 @@ void* clock_synchronization_thread(void* noargs);
 void* federate_info_thread_TCP(void* fed);
 
 /**
- * @brief Send a MSG_TYPE_REJECT message to the specified socket and close the socket.
+ * @brief Send a MSG_TYPE_REJECT message to the specified channel and close the channel.
  * @ingroup RTI
  *
- * @param socket_id Pointer to the socket ID.
+ * @param net_abs Pointer to the network abstraction.
  * @param error_code An error code.
  */
-void send_reject(int* socket_id, unsigned char error_code);
-
-/**
- * @brief Wait for one incoming connection request from each federate,
- * and, upon receiving it, create a thread to communicate with that federate.
- * @ingroup RTI
- *
- * Return when all federates have connected.
- *
- * @param socket_descriptor The socket on which to accept connections.
- */
-void lf_connect_to_federates(int socket_descriptor);
+void send_reject(net_abstraction_t net_abs, rejection_code_t error_code);
 
 /**
  * @brief Thread to respond to new connections, which could be federates of other federations
@@ -398,20 +453,36 @@ void* respond_to_erroneous_connections(void* nothing);
 void initialize_federate(federate_info_t* fed, uint16_t id);
 
 /**
- * @brief Start the socket server for the runtime infrastructure (RTI) and return the socket descriptor.
+ * @brief Free a federate_info_t and all heap memory it owns.
  * @ingroup RTI
  *
- * @param port The port on which to listen for socket connections, or 0 to use the default port range.
+ * Frees nested allocations (`in_transit_message_tags`, `downstream_transients`,
+ * and the immediate upstream/downstream arrays), shuts down `net` if still open,
+ * then frees the struct itself. Safe to call with NULL.
+ *
+ * @param fed The federate to free.
  */
-int32_t start_rti_server(uint16_t port);
+void free_federate_info(federate_info_t* fed);
+
+/**
+ * @brief Reset the federate. The federate has to be transient.
+ * @ingroup RTI
+ *
+ * @param fed A pointer to the federate
+ */
+void reset_transient_federate(federate_info_t* fed);
+
+/**
+ * @brief Start the server for the runtime infrastructure (RTI).
+ * @ingroup RTI
+ */
+int start_rti_server();
 
 /**
  * @brief Start the runtime infrastructure (RTI) interaction with the federates and wait for the federates to exit.
  * @ingroup RTI
- *
- * @param socket_descriptor The socket descriptor returned by start_rti_server().
  */
-void wait_for_federates(int socket_descriptor);
+void wait_for_federates();
 
 /**
  * @brief Print a usage message.

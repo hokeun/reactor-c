@@ -9,16 +9,21 @@
 #include "pythontarget.h"
 #include "modal_models/definitions.h"
 #include "platform.h" // defines MAX_PATH on Windows
+#include <stdlib.h>
+#include <string.h>
 #include "python_action.h"
 #include "python_port.h"
 #include "python_tag.h"
 #include "python_time.h"
 #include "reactor.h"
-#include "reactor.h"
 #include "tag.h"
 #include "util.h"
 #include "environment.h"
 #include "api/schedule.h"
+#include "tracepoint.h"
+#ifdef FEDERATED
+#include "federate.h"
+#endif
 
 ////////////// Global variables ///////////////
 // The global Python object that holds the .py module that the
@@ -51,25 +56,51 @@ PyObject* py_schedule(PyObject* self, PyObject* args) {
   }
 
   trigger_t* trigger = action->trigger;
+  environment_t* env = action->parent->environment;
   lf_token_t* t = NULL;
 
-  // Check to see if value exists and token is not NULL
-  if (value && (trigger->tmplt.token != NULL)) {
-    // DEBUG: adjust the element_size (might not be necessary)
-    trigger->tmplt.token->type->element_size = sizeof(PyObject*);
+  LF_CRITICAL_SECTION_ENTER(env);
+
+  // Check to see if value exists
+  if (value) {
+    // Allocate a fresh token for this schedule call rather than routing through
+    // _lf_initialize_token_with_value / _lf_get_token. Those paths may reuse
+    // or replace trigger->tmplt.token, which races with the reaction prologue
+    // that reads trigger->tmplt.token->value after an event pop:
+    //
+    //   1. The scheduler pops an event, sets trigger->tmplt.token = T, and
+    //      drops T->ref_count to 1 before releasing the environment lock.
+    //   2. A concurrent schedule acquires the environment lock and enters
+    //      _lf_get_token, which sees ref_count == 1 and reuses T, freeing
+    //      its payload and overwriting it with the new value.
+    //   3. The pending reaction finally runs and reads the corrupted value.
+    //
+    // Allocating a fresh token that lives only on the event queue until
+    // _lf_pop_events installs it into the template means schedule paths
+    // never write to trigger->tmplt.token, so concurrent schedulers cannot
+    // corrupt the payload of a token about to be consumed by a reaction.
     trigger->tmplt.type.element_size = sizeof(PyObject*);
-    t = _lf_initialize_token_with_value(&trigger->tmplt, value, 1);
+    t = lf_new_token((void*)&trigger->tmplt, value, 1);
+#if !defined NDEBUG
+    // Keep the payload allocation counter balanced with the decrement that
+    // occurs when the token's value is eventually freed.
+    LF_CRITICAL_SECTION_ENTER(GLOBAL_ENVIRONMENT);
+    extern int _lf_count_payload_allocations;
+    _lf_count_payload_allocations++;
+    LF_CRITICAL_SECTION_EXIT(GLOBAL_ENVIRONMENT);
+#endif
 
     // Also give the new value back to the Python action itself
     Py_INCREF(value);
     act->value = value;
   }
 
-  // Pass the token along
-  lf_schedule_token(action, offset, t);
+  lf_schedule_trigger(env, trigger, offset, t);
+  lf_notify_of_event(env);
+
+  LF_CRITICAL_SECTION_EXIT(env);
 
   // FIXME: handle is not passed to the Python side
-
   Py_INCREF(Py_None);
   return Py_None;
 }
@@ -78,12 +109,6 @@ PyObject* py_schedule(PyObject* self, PyObject* args) {
  * Prototype for the main function.
  */
 int lf_reactor_c_main(int argc, const char* argv[]);
-
-/**
- * Prototype for lf_request_stop().
- * @see reactor.h
- */
-void lf_request_stop(void);
 
 ///////////////// Other useful functions /////////////////////
 /**
@@ -94,6 +119,121 @@ PyObject* py_request_stop(PyObject* self, PyObject* args) {
 
   Py_INCREF(Py_None);
   return Py_None;
+}
+
+/**
+ * Stop only this federate at one microstep later than its current tag. Unlike
+ * request_stop(), this does not involve the RTI or require consensus among
+ * federates. This is particularly useful for testing transient federates.
+ */
+PyObject* py_lf_stop(PyObject* self, PyObject* args) {
+  (void)self;
+  (void)args;
+  // lf_stop() locks the environment mutex, which may be held by a scheduler
+  // thread that is itself blocked trying to acquire the GIL to invoke a
+  // reaction. Release the GIL here to avoid an AB-BA deadlock between the two.
+  Py_BEGIN_ALLOW_THREADS
+#ifdef FEDERATED
+  lf_stop();
+#else
+  // lf_stop() (stop this federate only, without RTI involvement) is only
+  // defined in federated builds. In a non-federated program there is only
+  // one federate, so requesting a (global) stop is equivalent.
+  lf_request_stop();
+#endif // FEDERATED
+  Py_END_ALLOW_THREADS
+
+      Py_INCREF(Py_None);
+  return Py_None;
+}
+
+/**
+ * Return the global maxwait for the current federate (only available in
+ * decentralized federated execution).
+ */
+PyObject* py_get_fed_maxwait(PyObject* self, PyObject* args) {
+#ifdef FEDERATED_DECENTRALIZED
+  (void)self;
+  (void)args;
+  return PyLong_FromLongLong(lf_get_fed_maxwait());
+#else
+  (void)self;
+  (void)args;
+  PyErr_SetString(PyExc_RuntimeError, "lf.get_fed_maxwait() is only available in decentralized federated execution.");
+  return NULL;
+#endif // FEDERATED_DECENTRALIZED
+}
+
+/**
+ * @brief Convert a non-negative Python number to an interval_t.
+ * @param py_number The Python number (a long long or a double).
+ * @param interval Pointer to the interval_t to store the result.
+ * @return True if the conversion was successful, false otherwise or if the number is negative or NaN.
+ */
+static bool convert_python_number_to_interval_t(PyObject* py_number, interval_t* interval) {
+  // Check if the number is a long long
+  if (PyLong_Check(py_number)) {
+    long long number_ll = PyLong_AsLongLong(py_number);
+    if (number_ll == -1 && PyErr_Occurred()) {
+      return false;
+    }
+    if (number_ll < 0) {
+      PyErr_SetString(PyExc_ValueError, "A time interval must be non-negative");
+      return false;
+    }
+    if (number_ll > INT64_MAX) {
+      PyErr_SetString(PyExc_OverflowError, "The time interval value is out of int64 range");
+      return false;
+    }
+    *interval = (interval_t)number_ll;
+    return true;
+  } else {
+    double number_in_double = PyFloat_AsDouble(py_number);
+    if (number_in_double == -1.0 && PyErr_Occurred()) {
+      PyErr_SetString(PyExc_TypeError, "expected a non-negative int or float");
+      return false;
+    }
+    // Reject NaN explicitly (NaN comparisons are always false).
+    if (number_in_double != number_in_double) {
+      PyErr_SetString(PyExc_ValueError, "A time interval cannot be NaN");
+      return false;
+    }
+    if (number_in_double < 0.0) {
+      PyErr_SetString(PyExc_ValueError, "A time interval must be non-negative");
+      return false;
+    }
+    if (number_in_double > (double)INT64_MAX) {
+      PyErr_SetString(PyExc_OverflowError, "The time interval value is out of int64 range");
+      return false;
+    }
+    *interval = (interval_t)number_in_double;
+    return true;
+  }
+}
+
+/**
+ * Set the global maxwait for the current federate (only available in
+ * decentralized federated execution).
+ */
+PyObject* py_set_fed_maxwait(PyObject* self, PyObject* args) {
+#ifdef FEDERATED_DECENTRALIZED
+  interval_t interval;
+  PyObject* py_offset = NULL;
+  if (!PyArg_ParseTuple(args, "O", &py_offset)) {
+    return NULL;
+  }
+  if (!convert_python_number_to_interval_t(py_offset, &interval)) {
+    return NULL;
+  }
+  lf_set_fed_maxwait(interval);
+  Py_INCREF(Py_None);
+  return Py_None;
+#else
+  (void)self;
+  (void)args;
+  PyErr_SetString(PyExc_RuntimeError, "lf.set_fed_maxwait() is only available in decentralized federated execution.");
+  return NULL;
+#endif // FEDERATED_DECENTRALIZED
 }
 
 PyObject* py_source_directory(PyObject* self, PyObject* args) {
@@ -114,6 +254,23 @@ PyObject* py_package_directory(PyObject* self, PyObject* args) {
 #else
   return PyUnicode_DecodeFSDefault(LF_PACKAGE_DIRECTORY);
 #endif
+}
+
+/**
+ * Return the ID of the federation that this federate belongs to.
+ * Only meaningful in federated execution.
+ */
+PyObject* py_get_federation_id(PyObject* self, PyObject* args) {
+#ifdef FEDERATED
+  (void)self;
+  (void)args;
+  return PyUnicode_DecodeFSDefault(lf_get_federation_id());
+#else
+  (void)self;
+  (void)args;
+  PyErr_SetString(PyExc_RuntimeError, "lf.get_federation_id() is only available in federated execution.");
+  return NULL;
+#endif // FEDERATED
 }
 
 /**
@@ -240,6 +397,115 @@ PyObject* py_check_deadline(PyObject* self, PyObject* args) {
   return PyBool_FromLong(result);
 }
 
+PyObject* py_update_deadline(PyObject* self, PyObject* args) {
+  PyObject* py_self;
+  PyObject* py_deadline;
+
+  if (!PyArg_ParseTuple(args, "OO", &py_self, &py_deadline)) {
+    return NULL;
+  }
+
+  interval_t updated_deadline;
+  if (!convert_python_number_to_interval_t(py_deadline, &updated_deadline)) {
+    return NULL;
+  }
+
+  void* self_ptr = get_lf_self_pointer(py_self);
+  if (self_ptr == NULL) {
+    return NULL;
+  }
+  lf_update_deadline(self_ptr, updated_deadline);
+
+  Py_INCREF(Py_None);
+  return Py_None;
+}
+
+/**
+ * Register a user trace event. Returns an opaque handle (as a Python int)
+ * that must be passed to tracepoint_user_event and tracepoint_user_value.
+ * When tracing is disabled, returns 0 and tracepoint calls are no-ops.
+ */
+PyObject* py_register_user_trace_event(PyObject* self, PyObject* args) {
+  PyObject* py_self;
+  const char* description = NULL;
+
+  if (!PyArg_ParseTuple(args, "Os", &py_self, &description)) {
+    return NULL;
+  }
+  void* self_ptr = get_lf_self_pointer(py_self);
+  if (self_ptr == NULL) {
+    return NULL;
+  }
+  size_t len = strlen(description) + 1;
+  /* Allocate on the reactor's allocation record so it is freed when the reactor is deallocated. */
+  char* desc_copy = (char*)lf_allocate(len, 1, &((self_base_t*)self_ptr)->allocations);
+  if (desc_copy == NULL) {
+    PyErr_NoMemory();
+    return NULL;
+  }
+  memcpy(desc_copy, description, len);
+  int result = register_user_trace_event(self_ptr, desc_copy);
+  if (!result) {
+    return PyLong_FromLong(0);
+  }
+  return PyLong_FromVoidPtr(desc_copy);
+}
+
+/**
+ * Trace a user-defined event. The handle must be the handle
+ * returned by register_user_trace_event (an int).
+ */
+PyObject* py_tracepoint_user_event(PyObject* self, PyObject* args) {
+  PyObject* py_self;
+  PyObject* handle = NULL;
+
+  if (!PyArg_ParseTuple(args, "OO", &py_self, &handle)) {
+    return NULL;
+  }
+  void* self_ptr = get_lf_self_pointer(py_self);
+  if (self_ptr == NULL) {
+    return NULL;
+  }
+  char* desc_ptr = (char*)PyLong_AsVoidPtr(handle);
+  if (desc_ptr == NULL && PyErr_Occurred()) {
+    return NULL;
+  }
+  if (desc_ptr != NULL) {
+    tracepoint_user_event(self_ptr, desc_ptr);
+  }
+
+  Py_INCREF(Py_None);
+  return Py_None;
+}
+
+/**
+ * Trace a user-defined event with a value. The handle must be
+ * the handle returned by register_user_trace_event (an int).
+ */
+PyObject* py_tracepoint_user_value(PyObject* self, PyObject* args) {
+  PyObject* py_self;
+  PyObject* handle = NULL;
+  long long value = 0;
+
+  if (!PyArg_ParseTuple(args, "OOL", &py_self, &handle, &value)) {
+    return NULL;
+  }
+  void* self_ptr = get_lf_self_pointer(py_self);
+  if (self_ptr == NULL) {
+    return NULL;
+  }
+  char* desc_ptr = (char*)PyLong_AsVoidPtr(handle);
+  if (desc_ptr == NULL && PyErr_Occurred()) {
+    return NULL;
+  }
+  if (desc_ptr != NULL) {
+    tracepoint_user_value(self_ptr, desc_ptr, value);
+  }
+
+  Py_INCREF(Py_None);
+  return Py_None;
+}
+
 //////////////////////////////////////////////////////////////
 ///////////// Main function callable from Python code
 
@@ -267,10 +533,23 @@ PyObject* py_main(PyObject* self, PyObject* py_args) {
   int num_environments = _lf_get_environments(&top_level_environment);
   LF_ASSERT(num_environments == 1, "Python target only supports programs with a single environment/enclave");
 
-  Py_BEGIN_ALLOW_THREADS lf_reactor_c_main(argc, argv);
+  // Python's start() ignores this return value, so a non-zero status from
+  // lf_reactor_c_main (for example an RTI failure) must terminate the process.
+  // exit() runs the atexit termination handler registered by the runtime.
+  int status;
+  Py_BEGIN_ALLOW_THREADS status = lf_reactor_c_main(argc, argv);
   Py_END_ALLOW_THREADS
 
-      Py_INCREF(Py_None);
+#ifdef LF_TRACE
+  // Ensure trace buffers are flushed for Python runs
+  lf_tracing_global_shutdown();
+#endif
+
+  if (status != 0) {
+    exit(status);
+  }
+
+  Py_INCREF(Py_None);
   return Py_None;
 }
 
@@ -287,12 +566,29 @@ PyObject* py_main(PyObject* self, PyObject* py_args) {
 static PyMethodDef GEN_NAME(MODULE_NAME, _methods)[] = {
     {"start", py_main, METH_VARARGS, NULL},
     {"tag", py_lf_tag, METH_NOARGS, NULL},
+    {"tag_start_effective", py_lf_tag_start_effective, METH_NOARGS, "Get the effective start tag of this federate"},
     {"tag_compare", py_tag_compare, METH_VARARGS, NULL},
     {"request_stop", py_request_stop, METH_NOARGS, "Request stop"},
+    {"stop", py_lf_stop, METH_NOARGS,
+     "Stop only this federate, at one microstep later than its current tag, without RTI involvement"},
+    {"get_fed_maxwait", py_get_fed_maxwait, METH_NOARGS,
+     "Get the global maxwait for the current federate (decentralized federated execution only)"},
+    {"set_fed_maxwait", (PyCFunction)py_set_fed_maxwait, METH_VARARGS,
+     "Set the global maxwait for the current federate (decentralized federated execution only)"},
     {"source_directory", py_source_directory, METH_NOARGS, "Source directory path for .lf file"},
     {"package_directory", py_package_directory, METH_NOARGS, "Root package directory path"},
+    {"get_federation_id", py_get_federation_id, METH_NOARGS,
+     "Get the ID of the federation this federate belongs to (federated execution only)"},
     {"check_deadline", (PyCFunction)py_check_deadline, METH_VARARGS,
      "Check whether the deadline of the currently executing reaction has passed"},
+    {"update_deadline", (PyCFunction)py_update_deadline, METH_VARARGS,
+     "Update the deadline of the currently executing reaction"},
+    {"register_user_trace_event", (PyCFunction)py_register_user_trace_event, METH_VARARGS,
+     "Register a user trace event; returns a handle for use with tracepoint_user_event and tracepoint_user_value"},
+    {"tracepoint_user_event", (PyCFunction)py_tracepoint_user_event, METH_VARARGS,
+     "Trace a user-defined event (pass the handle from register_user_trace_event)"},
+    {"tracepoint_user_value", (PyCFunction)py_tracepoint_user_value, METH_VARARGS,
+     "Trace a user-defined event with a value (pass the handle from register_user_trace_event)"},
     {NULL, NULL, 0, NULL}};
 
 /**
@@ -614,6 +910,42 @@ PyObject* get_python_instance(string module, string class, int instance_id) {
   lf_print_error("Failed to load \"%s\".", module);
   PyGILState_Release(gstate);
   return NULL;
+}
+
+long lf_py_get_nonnegative_integer_parameter(string module, string instance_name, int instance_id, string param_name) {
+  PyGILState_STATE gstate = PyGILState_Ensure();
+  long result = -1;
+
+  PyObject* py_inst = get_python_instance(module, instance_name, instance_id);
+  if (py_inst == NULL) {
+    Py_DECREF(py_inst);
+    PyGILState_Release(gstate);
+    return -1;
+  }
+
+  PyObject* py_param = PyObject_GetAttrString(py_inst, param_name);
+  Py_DECREF(py_inst);
+  if (py_param == NULL) {
+    // Attribute lookup failed; log and clear the Python exception to avoid
+    // leaving a pending exception that could affect later code.
+    lf_print_error("Could not get Python parameter '%s' from instance '%s'.", param_name, instance_name);
+    PyErr_Clear();
+    PyGILState_Release(gstate);
+    return -1;
+  }
+
+  result = PyLong_AsLong(py_param);
+  if (PyErr_Occurred()) {
+    // Conversion to long failed (e.g., wrong type or overflow). Log and
+    // clear the exception, and return an error value.
+    lf_print_error("Could not convert Python parameter '%s' of instance '%s' to long.", param_name, instance_name);
+    PyErr_Clear();
+    result = -1;
+  }
+  Py_DECREF(py_param);
+
+  PyGILState_Release(gstate);
+  return result;
 }
 
 int set_python_field_to_c_pointer(string module, string class, int instance_id, string field, void* pointer) {

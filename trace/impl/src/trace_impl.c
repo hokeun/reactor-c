@@ -20,7 +20,7 @@
 
 // PRIVATE DATA STRUCTURES ***************************************************
 
-static lf_platform_mutex_ptr_t trace_mutex;
+static lf_platform_mutex_ptr_t trace_mutex = NULL;
 static trace_t trace;
 static int process_id;
 static int64_t start_time;
@@ -260,16 +260,58 @@ void lf_tracing_global_init(char* process_name, char* process_names, int fedid, 
   }
   process_id = fedid;
   char filename[100];
+
+  // When tracing transient federates, a new trace file is created for each execution. For this, the function
+  // checks for file existence. If the file exists, the function appends a number to the file name and checks
+  // again.
+  int iter = 0;
+  bool file_exists = false;
+  bool new_file = false;
   if (strcmp(process_name, "rti") == 0) {
     snprintf(filename, sizeof(filename), "%s.lft", process_name);
   } else {
-    snprintf(filename, sizeof(filename), "%s_%d.lft", process_name, process_id);
+    FILE* file;
+    do {
+      if (iter == 0) {
+        snprintf(filename, sizeof(filename), "%s_%d.lft", process_name, process_id);
+      } else {
+        snprintf(filename, sizeof(filename), "%s_%d_%d.lft", process_name, process_id, iter);
+      }
+      file = fopen(filename, "r");
+      if (file) {
+        file_exists = true;
+        new_file = true;
+        fclose(file);
+        iter++;
+      } else {
+        file_exists = false;
+      }
+    } while (file_exists);
+  }
+  if (new_file) {
+    lf_print_warning("No overwriting! The default file name already exists. A new trace file named %s is created.",
+                     filename);
   }
   trace_new(filename);
   start_trace(&trace, max_num_local_threads);
 }
 void lf_tracing_set_start_time(int64_t time) { start_time = time; }
+
+void lf_tracing_flush() {
+  if (trace_mutex == NULL || trace._lf_trace_stop) {
+    return;
+  }
+  lf_platform_mutex_lock(trace_mutex);
+  for (int i = -1; i < (int)trace._lf_number_of_trace_buffers; i++) {
+    flush_trace_locked(&trace, i);
+  }
+  lf_platform_mutex_unlock(trace_mutex);
+}
+
 void lf_tracing_global_shutdown() {
-  stop_trace(&trace);
-  lf_platform_mutex_free(trace_mutex);
+  if (trace_mutex != NULL && !trace._lf_trace_stop) {
+    stop_trace(&trace);
+    lf_platform_mutex_free(trace_mutex);
+    trace_mutex = NULL;
+  }
 }

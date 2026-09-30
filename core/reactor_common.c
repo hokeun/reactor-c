@@ -11,6 +11,7 @@
  */
 #include <assert.h>
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 #include <time.h>
 
@@ -38,6 +39,10 @@
 #include "watchdog.h"
 #endif
 
+#ifdef LF_ENCLAVES
+#include "rti_local.h"
+#endif
+
 // Global variable defined in tag.c:
 extern instant_t start_time;
 
@@ -52,10 +57,13 @@ extern int _lf_count_payload_allocations;
  * @brief Global STA (safe to advance) offset uniformly applied to advancement of each
  * time step in federated execution.
  *
- * This can be retrieved in user code by calling lf_get_sta() and adjusted by
- * calling lf_set_sta(interval_t offset).
+ * The default is FOREVER, meaning that, by default, a decentralized federate will
+ * wait indefinitely for inputs to become known before declaring them absent. The
+ * value can be overridden either via the `@maxwait` attribute on the federate
+ * instantiation or in user code by calling lf_set_sta(interval_t offset). It can
+ * be retrieved in user code by calling lf_get_sta().
  */
-interval_t lf_fed_STA_offset = 0LL;
+interval_t lf_fed_STA_offset = FOREVER;
 
 #endif // FEDERATED_DECENTRALIZED
 
@@ -83,8 +91,29 @@ unsigned int _lf_number_of_workers = 0u;
  */
 instant_t duration = -1LL;
 
+/**
+ * If nonzero, the start of the program is delayed so that the starting logical
+ * time is an integer multiple of this value (in nanoseconds). The default of 0
+ * means that no such alignment is performed and the program starts as soon as
+ * possible. This is set by the `-m` or `--start-time-multiple` command-line
+ * option. In federated execution, this alignment is performed by the RTI (which
+ * receives the option from the generated launch script), not by the individual
+ * federates, so this variable is unused in federates.
+ */
+instant_t start_time_multiple = 0LL;
+
 /** Indicator of whether the keepalive command-line option was given. */
 bool keepalive_specified = false;
+
+instant_t lf_align_to_start_time_multiple(instant_t time) {
+  if (start_time_multiple > 0LL) {
+    instant_t remainder = time % start_time_multiple;
+    if (remainder != 0LL) {
+      time += start_time_multiple - remainder;
+    }
+  }
+  return time;
+}
 
 void* lf_allocate(size_t count, size_t size, struct allocation_record_t** head) {
   void* mem = calloc(count, size);
@@ -186,9 +215,13 @@ interval_t lf_get_stp_offset() { return lf_fed_STA_offset; }
 
 interval_t lf_get_sta() { return lf_fed_STA_offset; }
 
+interval_t lf_get_fed_maxwait() { return lf_fed_STA_offset; }
+
 void lf_set_stp_offset(interval_t offset) { lf_set_sta(offset); }
 
-void lf_set_sta(interval_t offset) { lf_fed_STA_offset = offset; }
+void lf_set_sta(interval_t offset) { lf_set_fed_maxwait(offset); }
+
+void lf_set_fed_maxwait(interval_t offset) { lf_fed_STA_offset = offset; }
 
 #endif // FEDERATED_DECENTRALIZED
 
@@ -199,7 +232,7 @@ void _lf_start_time_step(environment_t* env) {
     // due to an error.
     return;
   }
-  LF_PRINT_LOG("--------- Start time step at tag " PRINTF_TAG ".", env->current_tag.time - start_time,
+  LF_PRINT_LOG("--------- Env: %u Start time step at tag " PRINTF_TAG ".", env->id, env->current_tag.time - start_time,
                env->current_tag.microstep);
   // Handle dynamically created tokens for mutable inputs.
   _lf_free_token_copies();
@@ -378,6 +411,9 @@ event_t* lf_get_new_event(environment_t* env) {
 #ifdef FEDERATED_DECENTRALIZED
     e->intended_tag = (tag_t){.time = NEVER, .microstep = 0u};
 #endif
+    LF_PRINT_DEBUG("lf_get_new_event: Allocated event: %p", (void*)e);
+  } else {
+    LF_PRINT_DEBUG("lf_get_new_event: Retrieved event from the recycle queue: %p", (void*)e);
   }
   return e;
 }
@@ -524,6 +560,7 @@ trigger_handle_t _lf_schedule_at_tag(environment_t* env, trigger_t* trigger, tag
                  tag.microstep, current_logical_tag.time - start_time, current_logical_tag.microstep);
   if (lf_tag_compare(tag, current_logical_tag) <= 0 && env->execution_started) {
     lf_print_warning("_lf_schedule_at_tag(): requested to schedule an event at the current or past tag.");
+    _lf_done_using(token);
     return -1;
   }
 
@@ -566,7 +603,7 @@ trigger_handle_t _lf_schedule_at_tag(environment_t* env, trigger_t* trigger, tag
         _lf_done_using(token);
       }
       lf_recycle_event(env, e);
-      return (0);
+      return 0;
       break;
     case replace:
       // Replace the payload of the event at the head with our
@@ -580,9 +617,10 @@ trigger_handle_t _lf_schedule_at_tag(environment_t* env, trigger_t* trigger, tag
       // intended tag.
       tag.microstep++;
       e->base.tag = tag;
-      if (lf_is_tag_after_stop_tag(env, (tag_t){.time = tag.time, .microstep = tag.microstep})) {
+      if (lf_is_tag_after_stop_tag(env, tag)) {
         // Scheduling e will incur a microstep after the stop tag,
         // which is illegal.
+        _lf_done_using(token);
         lf_recycle_event(env, e);
         return 0;
       }
@@ -594,6 +632,37 @@ trigger_handle_t _lf_schedule_at_tag(environment_t* env, trigger_t* trigger, tag
     env->_lf_handle = 1;
   }
   return return_value;
+}
+
+trigger_handle_t _lf_schedule_token(environment_t* env, void* action, interval_t extra_delay, lf_token_t* token) {
+  LF_CRITICAL_SECTION_ENTER(env);
+  int return_value = lf_schedule_trigger(env, ((lf_action_base_t*)action)->trigger, extra_delay, token);
+  // Notify the main thread in case it is waiting for physical time to elapse.
+  lf_notify_of_event(env);
+  LF_CRITICAL_SECTION_EXIT(env);
+  return return_value;
+}
+
+trigger_handle_t _lf_schedule_copy(environment_t* env, void* action, interval_t offset, void* value, size_t length) {
+  if (value == NULL) {
+    return _lf_schedule_token(env, action, offset, NULL);
+  }
+  token_template_t* template = (token_template_t*)action;
+  if (action == NULL || template->type.element_size <= 0) {
+    lf_print_error("schedule: Invalid element size.");
+    return -1;
+  }
+  LF_CRITICAL_SECTION_ENTER(env);
+  // Initialize token with an array size of length and a reference count of 0.
+  lf_token_t* token = _lf_initialize_token(template, length);
+  // Copy the value into the newly allocated memory.
+  memcpy(token->value, value, template->type.element_size * length);
+  // The schedule function will increment the reference count.
+  trigger_handle_t result = lf_schedule_trigger(env, ((lf_action_base_t*)action)->trigger, offset, token);
+  // Notify the main thread in case it is waiting for physical time to elapse.
+  lf_notify_of_event(env);
+  LF_CRITICAL_SECTION_EXIT(env);
+  return result;
 }
 
 trigger_handle_t _lf_insert_reactions_for_trigger(environment_t* env, trigger_t* trigger, lf_token_t* token) {
@@ -611,6 +680,7 @@ trigger_handle_t _lf_insert_reactions_for_trigger(environment_t* env, trigger_t*
   // and not a physical action
   if (trigger->is_timer || trigger->is_physical) {
     lf_print_warning("_lf_schedule_init_reactions() called on a timer or physical action.");
+    _lf_done_using(token);
     return 0;
   }
 
@@ -618,6 +688,7 @@ trigger_handle_t _lf_insert_reactions_for_trigger(environment_t* env, trigger_t*
   // If this trigger is associated with an inactive mode, it should not trigger any reaction.
   if (!_lf_mode_is_active(trigger->mode)) {
     LF_PRINT_DEBUG("Suppressing reactions of trigger due inactivity of mode %s.", trigger->mode->name);
+    _lf_done_using(token);
     return 1;
   }
 #endif
@@ -632,6 +703,7 @@ trigger_handle_t _lf_insert_reactions_for_trigger(environment_t* env, trigger_t*
   // Check for STP violation in the centralized coordination, which is a
   // critical error.
   if (is_STP_violated) {
+    _lf_done_using(token);
     lf_print_error_and_exit(
         "Attempted to insert reactions for a trigger that had an intended tag that was in the past. "
         "This should not happen under centralized coordination. Intended tag: " PRINTF_TAG ". Current tag: " PRINTF_TAG
@@ -711,7 +783,6 @@ void _lf_advance_tag(environment_t* env, tag_t next_tag) {
 }
 
 /**
-
  * Invoke the given reaction
  *
  * @param env Environment in which we are executing.
@@ -765,23 +836,25 @@ void schedule_output_reactions(environment_t* env, reaction_t* reaction, int wor
   bool inherited_STP_violation = reaction->is_STP_violated;
   LF_PRINT_DEBUG("Reaction %s has STP violation status: %d.", reaction->name, reaction->is_STP_violated);
 #endif
-  LF_PRINT_DEBUG("There are %zu outputs from reaction %s.", reaction->num_outputs, reaction->name);
+  LF_PRINT_DEBUG("Env %u: There are %zu outputs from reaction %s.", env->id, reaction->num_outputs, reaction->name);
   for (size_t i = 0; i < reaction->num_outputs; i++) {
     if (reaction->output_produced[i] != NULL && *(reaction->output_produced[i])) {
-      LF_PRINT_DEBUG("Output %zu has been produced.", i);
+      LF_PRINT_DEBUG("Env %u: Output %zu has been produced.", env->id, i);
       trigger_t** triggerArray = (reaction->triggers)[i];
-      LF_PRINT_DEBUG("There are %d trigger arrays associated with output %zu.", reaction->triggered_sizes[i], i);
+      LF_PRINT_DEBUG("Env %u: There are %d trigger arrays associated with output %zu.", env->id,
+                     reaction->triggered_sizes[i], i);
       for (int j = 0; j < reaction->triggered_sizes[i]; j++) {
         trigger_t* trigger = triggerArray[j];
         if (trigger != NULL) {
-          LF_PRINT_DEBUG("Trigger %p lists %d reactions.", (void*)trigger, trigger->number_of_reactions);
+          LF_PRINT_DEBUG("Env %u: Trigger %p lists %d reactions.", env->id, (void*)trigger,
+                         trigger->number_of_reactions);
           for (int k = 0; k < trigger->number_of_reactions; k++) {
             reaction_t* downstream_reaction = trigger->reactions[k];
 #ifdef FEDERATED_DECENTRALIZED // Only pass down tardiness for federated LF programs
             // Set the is_STP_violated for the downstream reaction
             if (downstream_reaction != NULL) {
               downstream_reaction->is_STP_violated = inherited_STP_violation;
-              LF_PRINT_DEBUG("Passing is_STP_violated of %d to the downstream reaction: %s",
+              LF_PRINT_DEBUG("Env %u: Passing is_STP_violated of %d to the downstream reaction: %s", env->id,
                              downstream_reaction->is_STP_violated, downstream_reaction->name);
             }
 #endif
@@ -819,7 +892,7 @@ void schedule_output_reactions(environment_t* env, reaction_t* reaction, int wor
     }
   }
   if (downstream_to_execute_now != NULL) {
-    LF_PRINT_LOG("Worker %d: Optimizing and executing downstream reaction now: %s", worker,
+    LF_PRINT_LOG("Env %u: Worker %d: Optimizing and executing downstream reaction now: %s", env->id, worker,
                  downstream_to_execute_now->name);
     bool violation = false;
 #ifdef FEDERATED_DECENTRALIZED // Only use the STP handler for federated programs that use decentralized coordination
@@ -841,7 +914,7 @@ void schedule_output_reactions(environment_t* env, reaction_t* reaction, int wor
     //  chain until it is dealt with in a downstream STP handler.
     if (downstream_to_execute_now->is_STP_violated == true) {
       // Tardiness has occurred
-      LF_PRINT_LOG("Event has STP violation.");
+      LF_PRINT_LOG("Env %u: Event has STP violation.", env->id);
       reaction_function_t handler = downstream_to_execute_now->STP_handler;
       // Invoke the STP handler if there is one.
       if (handler != NULL) {
@@ -849,7 +922,7 @@ void schedule_output_reactions(environment_t* env, reaction_t* reaction, int wor
         // If there is no STP handler, pass the is_STP_violated
         // to downstream reactions.
         violation = true;
-        LF_PRINT_LOG("Invoke tardiness handler.");
+        LF_PRINT_LOG("Env %u: Invoke tardiness handler.", env->id);
         (*handler)(downstream_to_execute_now->self);
 
         // If the reaction produced outputs, put the resulting
@@ -859,7 +932,8 @@ void schedule_output_reactions(environment_t* env, reaction_t* reaction, int wor
         // Reset the tardiness because it has been dealt with in the
         // STP handler
         downstream_to_execute_now->is_STP_violated = false;
-        LF_PRINT_DEBUG("Reset reaction's is_STP_violated field to false: %s", downstream_to_execute_now->name);
+        LF_PRINT_DEBUG("Env %u: Reset reaction's is_STP_violated field to false: %s", env->id,
+                       downstream_to_execute_now->name);
       }
     }
 #endif
@@ -868,7 +942,7 @@ void schedule_output_reactions(environment_t* env, reaction_t* reaction, int wor
       instant_t physical_time = lf_time_physical();
       // Check for deadline violation.
       if (downstream_to_execute_now->deadline == 0 ||
-          physical_time > env->current_tag.time + downstream_to_execute_now->deadline) {
+          physical_time > lf_time_add(env->current_tag.time, downstream_to_execute_now->deadline)) {
         // Deadline violation has occurred.
         tracepoint_reaction_deadline_missed(env, downstream_to_execute_now, worker);
         violation = true;
@@ -898,39 +972,165 @@ void schedule_output_reactions(environment_t* env, reaction_t* reaction, int wor
     // Reset the is_STP_violated because it has been passed
     // down the chain
     downstream_to_execute_now->is_STP_violated = false;
-    LF_PRINT_DEBUG("Finally, reset reaction's is_STP_violated field to false: %s", downstream_to_execute_now->name);
+    LF_PRINT_DEBUG("Env %u: Finally, reset reaction's is_STP_violated field to false: %s", env->id,
+                   downstream_to_execute_now->name);
   }
 }
 
+// Defaults for the code-generated parameter table.
+// The code generator overrides these if there are user-defined parameters.
+lf_cli_param_t* _lf_cli_params = NULL;
+int _lf_cli_params_count = 0;
+
 /**
- * Print a usage message.
- * TODO: This is not necessary for NO_CLI
+ * Print a usage message listing user-defined parameters (if any) and runtime options.
  */
 void usage(int argc, const char* argv[]) {
-  printf("\nCommand-line arguments: \n\n");
-  printf("  -f, --fast [true | false]\n");
-  printf("   Whether to wait for physical time to match logical time.\n\n");
+#if defined(NO_CLI)
+  printf("\nNo command-line arguments are supported.\n");
+#else
+  printf("\nUsage: %s [options]\n\n", argv[0]);
+  if (_lf_cli_params_count > 0) {
+    printf("Reactor Parameters:\n");
+    for (int j = 0; j < _lf_cli_params_count; j++) {
+      lf_cli_param_t* p = &_lf_cli_params[j];
+      if (p->type == CLI_TIME) {
+        printf("  --%s <value> <units>\n", p->name);
+      } else if (p->type == CLI_BOOL) {
+        printf("  --%s <true|false>\n", p->name);
+      } else {
+        printf("  --%s <value>\n", p->name);
+      }
+      printf("      %s\n\n", p->description);
+    }
+  }
+  printf("Runtime Options:\n");
+  printf("  -f, --fast <true|false>\n");
+  printf("      Whether to wait for physical time to match logical time.\n\n");
   printf("  -o, --timeout <duration> <units>\n");
-  printf("   Stop after the specified amount of logical time, where units are one of\n");
-  printf("   nsec, usec, msec, sec, minute, hour, day, week, or the plurals of those.\n\n");
-  printf("  -k, --keepalive\n");
-  printf("   Whether continue execution even when there are no events to process.\n\n");
+  printf("      Stop after the specified amount of logical time, where units are one of\n");
+  printf("      nsec, usec, msec, sec, minute, hour, day, week, or the plurals of those.\n\n");
+  printf("  -m, --start-time-multiple <value> <units>\n");
+  printf("      Delay the start of the program so that the starting logical time is a\n");
+  printf("      multiple of the specified time, where units are one of ns, us, ms, s, min, hour, day, or week.\n\n");
+  printf("  -k, --keepalive <true|false>\n");
+  printf("      Whether to continue execution even when there are no events to process.\n\n");
   printf("  -w, --workers <n>\n");
-  printf("   Executed in <n> threads if possible (optional feature).\n\n");
-  printf("  -i, --id <n>\n");
-  printf("   The ID of the federation that this reactor will join.\n\n");
+  printf("      Execute in <n> threads if possible (optional feature).\n\n");
+  printf("  -h, --help\n");
+  printf("      Display this help message.\n\n");
 #ifdef FEDERATED
+  printf("  -i, --id <n>\n");
+  printf("      The ID of the federation that this reactor will join.\n\n");
   printf("  -r, --rti <n>\n");
-  printf("   The address of the RTI, which can be in the form of user@host:port or ip:port.\n\n");
+  printf("      The address of the RTI, which can be in the form of user@host:port or ip:port.\n\n");
   printf("  -l\n");
-  printf("   Send stdout to individual log files for each federate.\n\n");
+  printf("      Send stdout to individual log files for each federate.\n\n");
+#ifdef COMM_TYPE_SST
+  printf("  -sst, --sst <n>\n");
+  printf("      Path to the SST configuration file.\n\n");
 #endif
-
+#ifdef COMM_TYPE_TLS
+  printf("  -tls, --tls <certificate_path> <private_key_path>\n");
+  printf("      Paths to the TLS certificate and private key to use.\n\n");
+#endif
+#endif
+#endif
   printf("Command given:\n");
   for (int i = 0; i < argc; i++) {
     printf("%s ", argv[i]);
   }
   printf("\n\n");
+}
+
+/**
+ * Process user-defined main reactor parameters from the command line.
+ * Returns 0 on success, 1 for --help (exit 0), 2 for error (exit 1).
+ */
+int process_user_args(int argc, const char* argv[], int* newargc, const char** newargv) {
+  *newargc = 0;
+  newargv[(*newargc)++] = argv[0];
+  for (int i = 1; i < argc; i++) {
+    if (strcmp(argv[i], "--help") == 0 || strcmp(argv[i], "-h") == 0) {
+      usage(argc, argv);
+      return 1;
+    }
+    bool matched = false;
+    for (int j = 0; j < _lf_cli_params_count; j++) {
+      lf_cli_param_t* p = &_lf_cli_params[j];
+      char option[256];
+      snprintf(option, sizeof(option), "--%s", p->name);
+      if (strcmp(argv[i], option) == 0) {
+        matched = true;
+        if (p->is_width) {
+          fprintf(stderr, "Error: Command-line changes to multiport and bank widths"
+                          " are not supported.\n"
+                          "Change the width in the source code and recompile instead.\n");
+          return 2;
+        }
+        if (p->type == CLI_TIME) {
+          if (i + 2 >= argc) {
+            fprintf(stderr, "Error: --%s needs a time value and units (e.g., --%s 500 msec).\n", p->name, p->name);
+            return 2;
+          }
+          const char* time_str = argv[++i];
+          const char* unit_str = argv[++i];
+          if (lf_time_parse(time_str, unit_str, (interval_t*)p->value) != 0) {
+            fprintf(stderr, "Error: invalid time value '%s %s' for --%s.\n", time_str, unit_str, p->name);
+            return 2;
+          }
+          *p->given = true;
+        } else {
+          if (i + 1 >= argc) {
+            fprintf(stderr, "Error: --%s needs a value.\n", p->name);
+            return 2;
+          }
+          const char* val_str = argv[++i];
+          char* end;
+          switch (p->type) {
+          case CLI_INT:
+            *((int*)p->value) = atoi(val_str);
+            break;
+          case CLI_DOUBLE:
+            *((double*)p->value) = strtod(val_str, &end);
+            if (*end != '\0') {
+              fprintf(stderr, "Error: invalid double value '%s' for --%s.\n", val_str, p->name);
+              return 2;
+            }
+            break;
+          case CLI_FLOAT:
+            *((float*)p->value) = strtof(val_str, &end);
+            if (*end != '\0') {
+              fprintf(stderr, "Error: invalid float value '%s' for --%s.\n", val_str, p->name);
+              return 2;
+            }
+            break;
+          case CLI_BOOL:
+            if (strcmp(val_str, "true") == 0 || strcmp(val_str, "1") == 0) {
+              *((bool*)p->value) = true;
+            } else if (strcmp(val_str, "false") == 0 || strcmp(val_str, "0") == 0) {
+              *((bool*)p->value) = false;
+            } else {
+              fprintf(stderr, "Error: invalid bool value '%s' for --%s (expected true or false).\n", val_str, p->name);
+              return 2;
+            }
+            break;
+          case CLI_STRING:
+            *((const char**)p->value) = val_str;
+            break;
+          default:
+            break;
+          }
+          *p->given = true;
+        }
+        break;
+      }
+    }
+    if (!matched) {
+      newargv[(*newargc)++] = argv[i];
+    }
+  }
+  return 0;
 }
 
 // Some options given in the target directive are provided here as
@@ -942,7 +1142,6 @@ const char** default_argv = NULL;
  * Process the command-line arguments. If the command line arguments are not
  * understood, then print a usage message and return 0. Otherwise, return 1.
  * @return 1 if the arguments processed successfully, 0 otherwise.
- * TODO: Not necessary for NO_CLI
  */
 int process_args(int argc, const char* argv[]) {
   int i = 1;
@@ -971,39 +1170,30 @@ int process_args(int argc, const char* argv[]) {
       }
       const char* time_spec = argv[i++];
       const char* units = argv[i++];
-
-#if defined(PLATFORM_ARDUINO)
-      duration = atol(time_spec);
-#else
-      duration = atoll(time_spec);
-#endif
-
-      // A parse error returns 0LL, so check to see whether that is what is meant.
-      if (duration == 0LL && strncmp(time_spec, "0", 1) != 0) {
-        // Parse error.
-        lf_print_error("Invalid time value: %s", time_spec);
+      int parse_result = lf_time_parse(time_spec, units, &duration);
+      if (parse_result != 0) {
+        lf_print_error(parse_result == -1 ? "Invalid time value: %s" : "Invalid time units: %s",
+                       parse_result == -1 ? time_spec : units);
         usage(argc, argv);
         return 0;
       }
-      if (strncmp(units, "sec", 3) == 0) {
-        duration = SEC(duration);
-      } else if (strncmp(units, "msec", 4) == 0) {
-        duration = MSEC(duration);
-      } else if (strncmp(units, "usec", 4) == 0) {
-        duration = USEC(duration);
-      } else if (strncmp(units, "nsec", 4) == 0) {
-        duration = NSEC(duration);
-      } else if (strncmp(units, "min", 3) == 0) {
-        duration = MINUTE(duration);
-      } else if (strncmp(units, "hour", 4) == 0) {
-        duration = HOUR(duration);
-      } else if (strncmp(units, "day", 3) == 0) {
-        duration = DAY(duration);
-      } else if (strncmp(units, "week", 4) == 0) {
-        duration = WEEK(duration);
-      } else {
-        // Invalid units.
-        lf_print_error("Invalid time units: %s", units);
+    } else if (strcmp(arg, "-m") == 0 || strcmp(arg, "--start-time-multiple") == 0) {
+      if (argc < i + 2) {
+        lf_print_error("--start-time-multiple needs time and units.");
+        usage(argc, argv);
+        return 0;
+      }
+      const char* time_spec = argv[i++];
+      const char* units = argv[i++];
+      int parse_result = lf_time_parse(time_spec, units, &start_time_multiple);
+      if (parse_result != 0) {
+        lf_print_error(parse_result == -1 ? "Invalid time value: %s" : "Invalid time units: %s",
+                       parse_result == -1 ? time_spec : units);
+        usage(argc, argv);
+        return 0;
+      }
+      if (start_time_multiple < 0LL) {
+        lf_print_error("--start-time-multiple needs a non-negative time value.");
         usage(argc, argv);
         return 0;
       }
@@ -1021,6 +1211,9 @@ int process_args(int argc, const char* argv[]) {
       } else {
         lf_print_error("Invalid value for --keepalive: %s", keep_spec);
       }
+    } else if (strcmp(arg, "-h") == 0 || strcmp(arg, "--help") == 0) {
+      usage(argc, argv);
+      return 0;
     } else if (strcmp(arg, "-w") == 0 || strcmp(arg, "--workers") == 0) {
       if (argc < i + 1) {
         lf_print_error("--workers needs an integer argument.s");
@@ -1044,7 +1237,7 @@ int process_args(int argc, const char* argv[]) {
       }
       const char* fid = argv[i++];
       lf_set_federation_id(fid);
-      lf_print("Federation ID for executable %s: %s", argv[0], fid);
+      lf_print_log("Federation ID for executable %s: %s", argv[0], fid);
     } else if (strcmp(arg, "-r") == 0 || strcmp(arg, "--rti") == 0) {
       if (argc < i + 1) {
         lf_print_error("--rti needs a string argument in the form of [user]@[host]:[port].");
@@ -1074,12 +1267,53 @@ int process_args(int argc, const char* argv[]) {
       }
     }
 #endif
+#ifdef COMM_TYPE_SST
+    else if (strcmp(arg, "-sst") == 0 || strcmp(arg, "--sst") == 0) {
+      if (argc < i + 1) {
+        lf_print_error("--sst needs a string argument.");
+        usage(argc, argv);
+        return 0;
+      }
+      const char* fid = argv[i++];
+      lf_set_sst_config_path(fid);
+    }
+#endif
+#ifdef COMM_TYPE_TLS
+    else if (strcmp(arg, "-tls") == 0 || strcmp(arg, "--tls") == 0) {
+      // Need two arguments: cert path and key path
+      if (argc < i + 2) {
+        lf_print_error("--tls needs two arguments: <certificate_path> <private_key_path>.");
+        usage(argc, argv);
+        return 0;
+      }
+
+      const char* cert_path = argv[i++];
+      const char* key_path = argv[i++];
+
+      if (cert_path[0] == '\0' || key_path[0] == '\0') {
+        lf_print_error("--tls certificate_path and private_key_path must be non-empty.");
+        usage(argc, argv);
+        return 0;
+      }
+
+      lf_set_tls_configuration(cert_path, key_path);
+      lf_print("TLS cert path: %s", cert_path);
+      lf_print("TLS key path : %s", key_path);
+    }
+#endif
     else if (strcmp(arg, "--ros-args") == 0) {
       // FIXME: Ignore ROS arguments for now
     } else {
+#ifdef FEDERATED
+      // In federated programs, arguments intended for other federates
+      // may be forwarded here. Skip them silently.
+      lf_print_info("Ignoring unrecognized command-line argument: %s. Assuming it is intended for another federate.",
+                    arg);
+#else
       lf_print_error("Unrecognized command-line argument: %s", arg);
       usage(argc, argv);
       return 0;
+#endif
     }
   }
   return 1;
@@ -1177,18 +1411,29 @@ void termination(void) {
   // It should only be called for the top-level environment, which, by convention, is the first environment.
   lf_terminate_execution(env);
 
-  // In order to free tokens, we perform the same actions we would have for a new time step.
   for (int i = 0; i < num_envs; i++) {
     if (!env[i].initialized) {
-      lf_print_warning("---- Environment %u was never initialized", env[i].id);
+      lf_print_warning("---- Env %u was never initialized", env[i].id);
       continue;
     }
-    LF_PRINT_LOG("---- Terminating environment %u, normal termination: %d", env[i].id, _lf_normal_termination);
+    LF_PRINT_LOG("---- Terminating Env %u, normal termination: %d", env[i].id, _lf_normal_termination);
 
 #if !defined(LF_SINGLE_THREADED)
     // Make sure all watchdog threads have stopped
     _lf_watchdog_terminate_all(&env[i]);
 #endif
+  }
+
+  // Flush and close the trace file before any further cleanup. Remaining
+  // records live in per-thread memory buffers until this point; if cleanup
+  // below fails or the process is torn down, those records would be lost.
+  lf_tracing_global_shutdown();
+
+  // In order to free tokens, we perform the same actions we would have for a new time step.
+  for (int i = 0; i < num_envs; i++) {
+    if (!env[i].initialized) {
+      continue;
+    }
 
     // Skip most cleanup on abnormal termination.
     if (_lf_normal_termination) {
@@ -1198,13 +1443,23 @@ void termination(void) {
       // Free events and tokens suspended by modal reactors.
       _lf_terminate_modal_reactors(&env[i]);
 #endif
-      // If the event queue still has events on it, report that.
+      // If the event queue still has events on it, clear them and free their tokens.
       if (env[i].event_q != NULL && pqueue_tag_size(env[i].event_q) > 0) {
-        lf_print_warning("---- There are %zu unprocessed future events on the event queue.",
-                         pqueue_tag_size(env[i].event_q));
+        size_t unprocessed_events = pqueue_tag_size(env[i].event_q);
+        lf_print_warning("---- There are %zu unprocessed future events on the event queue.", unprocessed_events);
         event_t* event = (event_t*)pqueue_tag_peek(env[i].event_q);
         lf_print_warning("---- The first future event has timestamp " PRINTF_TAG " after start tag.",
                          event->base.tag.time - start_time, event->base.tag.microstep);
+
+        // Clear all unprocessed events and free their tokens
+        while (pqueue_tag_size(env[i].event_q) > 0) {
+          event_t* event = (event_t*)pqueue_tag_pop(env[i].event_q);
+          if (event->token != NULL) {
+            _lf_done_using(event->token);
+          }
+          lf_recycle_event(&env[i], event);
+        }
+        lf_print_warning("---- Cleared %zu unprocessed events from the event queue.", unprocessed_events);
       }
       // Print elapsed times.
       // If these are negative, then the program failed to start up.
@@ -1212,18 +1467,17 @@ void termination(void) {
       if (elapsed_time >= 0LL) {
         char time_buffer[29]; // 28 bytes is enough for the largest 64 bit number: 9,223,372,036,854,775,807
         lf_comma_separated_time(time_buffer, elapsed_time);
-        printf("---- Elapsed logical time (in nsec): %s\n", time_buffer);
+        lf_print_info("---- Elapsed logical time (in nsec): %s", time_buffer);
 
         // If start_time is 0, then execution didn't get far enough along
         // to initialize this.
         if (start_time > 0LL) {
           lf_comma_separated_time(time_buffer, lf_time_physical_elapsed());
-          printf("---- Elapsed physical time (in nsec): %s\n", time_buffer);
+          lf_print_info("---- Elapsed physical time (in nsec): %s", time_buffer);
         }
       }
     }
   }
-  lf_tracing_global_shutdown();
   // Skip most cleanup on abnormal termination.
   if (_lf_normal_termination) {
     _lf_free_all_tokens(); // Must be done before freeing reactors.

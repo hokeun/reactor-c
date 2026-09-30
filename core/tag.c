@@ -10,6 +10,7 @@
 #include <assert.h>
 #include <stdbool.h>
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 
 #include "tag.h"
@@ -30,6 +31,12 @@ typedef enum _lf_time_type { LF_LOGICAL, LF_PHYSICAL, LF_ELAPSED_LOGICAL, LF_ELA
 
 // Global variables declared in tag.h:
 instant_t start_time = NEVER;
+
+/**
+ * The effective start tag, which for persistent federates is the start tag of the federation
+ * and for transient federates is the start tag of the transient.
+ */
+tag_t effective_start_tag = {.time = 0LL, .microstep = 0};
 
 ////////////////  Functions declared in tag.h
 
@@ -114,6 +121,22 @@ int lf_tag_compare(tag_t tag1, tag_t tag2) {
   }
 }
 
+tag_t lf_tag_max(tag_t tag1, tag_t tag2) {
+  if (lf_tag_compare(tag1, tag2) < 0) {
+    return tag2;
+  } else {
+    return tag1;
+  }
+}
+
+tag_t lf_tag_min(tag_t tag1, tag_t tag2) {
+  if (lf_tag_compare(tag1, tag2) < 0) {
+    return tag1;
+  } else {
+    return tag2;
+  }
+}
+
 tag_t lf_delay_tag(tag_t tag, interval_t interval) {
   if (tag.time == NEVER || interval < 0LL)
     return tag;
@@ -171,6 +194,8 @@ instant_t lf_time_physical(void) {
 instant_t lf_time_physical_elapsed(void) { return lf_time_physical() - start_time; }
 
 instant_t lf_time_start(void) { return start_time; }
+
+tag_t lf_tag_start_effective(void) { return effective_start_tag; }
 
 size_t lf_readable_time(char* buffer, instant_t time) {
   if (time <= (instant_t)0) {
@@ -296,4 +321,32 @@ size_t lf_comma_separated_time(char* buffer, instant_t time) {
     result += 4;
   }
   return result;
+}
+
+int lf_time_parse(const char* time_str, const char* units_str, interval_t* result) {
+  char* end;
+  int value = (int)strtol(time_str, &end, 10);
+  if (*end != '\0') {
+    return -1;
+  }
+  if (strncmp(units_str, "nsec", 4) == 0 || strcmp(units_str, "ns") == 0) {
+    *result = NSEC(value);
+  } else if (strncmp(units_str, "usec", 4) == 0 || strcmp(units_str, "us") == 0) {
+    *result = USEC(value);
+  } else if (strncmp(units_str, "msec", 4) == 0 || strcmp(units_str, "ms") == 0) {
+    *result = MSEC(value);
+  } else if (strncmp(units_str, "second", 6) == 0 || strncmp(units_str, "sec", 3) == 0 || strcmp(units_str, "s") == 0) {
+    *result = SEC(value);
+  } else if (strncmp(units_str, "minute", 6) == 0 || strncmp(units_str, "min", 3) == 0) {
+    *result = MINUTE(value);
+  } else if (strncmp(units_str, "hour", 4) == 0) {
+    *result = HOUR(value);
+  } else if (strncmp(units_str, "day", 3) == 0) {
+    *result = DAY(value);
+  } else if (strncmp(units_str, "week", 4) == 0) {
+    *result = WEEK(value);
+  } else {
+    return -2;
+  }
+  return 0;
 }

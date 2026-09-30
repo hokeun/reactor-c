@@ -10,6 +10,7 @@
 #if defined(LF_SINGLE_THREADED)
 
 #include <assert.h>
+#include <stdlib.h>
 #include <string.h>
 
 #include "reactor.h"
@@ -17,6 +18,7 @@
 #include "low_level_platform.h"
 #include "reactor_common.h"
 #include "environment.h"
+#include "tracepoint.h"
 
 // Embedded platforms with no command line interface shouldnt have signals
 #if !defined(NO_CLI)
@@ -158,7 +160,7 @@ int _lf_do_step(environment_t* env) {
       // container deadlines are defined in the container.
       // They can have different deadlines, so we have to check both.
       // Handle the local deadline first.
-      if (reaction->deadline == 0 || physical_time > env->current_tag.time + reaction->deadline) {
+      if (reaction->deadline == 0 || physical_time > lf_time_add(env->current_tag.time, reaction->deadline)) {
         LF_PRINT_LOG("Deadline violation. Invoking deadline handler.");
         tracepoint_reaction_deadline_missed(env, reaction, 0);
         // Deadline violation has occurred.
@@ -331,7 +333,21 @@ int lf_reactor_c_main(int argc, const char* argv[]) {
     // Set start time
     start_time = lf_time_physical();
 #ifndef FEDERATED
+    // Optionally delay the start so that the starting logical time is a multiple
+    // of the value given with the -m/--start-time-multiple command-line option.
+    // In federated execution, this alignment is performed by the RTI instead.
+    start_time = lf_align_to_start_time_multiple(start_time);
     lf_tracing_set_start_time(start_time);
+    // The single-threaded runtime does not wait for the start time elsewhere, so
+    // if the start time has been pushed into the future, sleep until then. This keeps
+    // lf_time_start() and lf_time_physical_elapsed() consistent with the physical start time.
+    // (This applies even when running with --fast.)
+    if (start_time_multiple > 0LL) {
+      interval_t wait_duration = start_time - lf_time_physical();
+      if (wait_duration > 0LL) {
+        lf_sleep(wait_duration);
+      }
+    }
 #endif
 
     LF_PRINT_DEBUG("NOTE: FOREVER is displayed as " PRINTF_TAG " and NEVER as " PRINTF_TAG,
@@ -357,6 +373,16 @@ int lf_reactor_c_main(int argc, const char* argv[]) {
       while (next(env) != 0)
         ;
     }
+    // Persist remaining in-memory trace records before returning from main().
+    lf_tracing_flush();
+#ifdef FEDERATED
+    // Leave _lf_normal_termination false. termination() then skips the
+    // heap-walking cleanup, and lf_terminate_execution() does not try to
+    // talk to the dead RTI. Returning from main is the single call to exit().
+    if (lf_rti_has_failed()) {
+      return EXIT_FAILURE;
+    }
+#endif
     _lf_normal_termination = true;
     return 0;
   } else {
